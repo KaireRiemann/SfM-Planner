@@ -1,0 +1,343 @@
+fsm:
+  click_goal_en: true
+  click_goal_topic: "/goal"
+  click_goal_3d_en: true
+  click_goal_3d_topic: "/goal_3d"
+  click_height: 1.5
+  click_yaw_en: true
+  replan_rate: 15.0
+  cmd_topic: "/planning/pos_cmd"
+  mpc_cmd_topic: "/planning_cmd/poly_traj"
+  timer_en: true
+  perception_replan_check_rate: 60.0
+  perception_replan_check_horizon: 2.0
+  perception_replan_check_dt: 0.06
+  perception_replan_min_interval: 0.08
+  perception_replan_consecutive_hits: 1
+  perception_replan_emergency_horizon: 0.45
+
+general_planner:
+  backup_traj_en: true
+  esdf_traj_en: false
+  esdf_safe_distance: 0.3
+  detailed_log_en: false
+  visualization_en: true
+  use_fov_cut: false
+  print_log: false
+  visual_process: false
+  frontend_in_known_free: false
+  goal_yaw_en: false
+  goal_vel_en: false
+  corridor_bound_dis: 2.0
+  corridor_line_max_length: 2.0
+  safe_corridor_line_max_length: 15.0
+  iris_iter_num: 2
+  ellipsoid_optimizer: classic
+  ellipsoid_optimizer_fallback: false
+  obs_skip_num: 2
+  replan_forward_dt: 0.1
+  planning_horizon: 15.0
+  sensing_horizon: -1
+  receding_dis: 8.0
+  robot_r: 0.2
+  frontend_astar_time_out: 0.35
+  over_wall_search_en: true
+  over_wall_max_climb: 3.0
+  over_wall_height_step: 0.3
+  over_wall_min_blocked_span: 0.8
+  over_wall_min_progress_gain: 0.5
+  over_wall_forward_ratio: 0.9
+  dynamic_obstacle_layer:
+    enable: false
+    cloud_topic: "/cloud_registered"
+    cloud_queue_size: 3
+    odom_timeout: 0.2
+    ttl: 0.35
+    voxel_size: 0.20
+    inflation_radius: 0.40
+    line_check_step: 0.05
+    max_points_per_frame: 30000
+    local_half_size: [ 12, 12, 3 ]
+  state2state:
+    direct_line_frontend_enable: true
+    topology:
+      enable: true
+      # Build, record and visualize only. Keep topology completely outside the
+      # latency-sensitive state2state frontend.
+      query_enable: false
+      # Persistent, globally aligned dense roadmap over sensor-observed free
+      # space. Unknown cells and planned-but-unobserved routes are excluded.
+      construction_mode: dense_known_free
+      # State2state in this profile navigates inside a narrow inflated height
+      # band. Sample the sensor-observed plane at the actual flight/LiDAR
+      # height; the virtual-height midpoint is not necessarily observed.
+      planar_mode: true
+      navigation_altitude: 1.5
+      unknown_as_free: false
+      min_query_distance: 3.0
+      # Four 4x4 m regions at 20 Hz can follow a fast moving observation
+      # window, while RViz receives a bounded 2 Hz immutable snapshot.
+      update_budget: 4
+      update_period: 0.05
+      publish_period: 0.50
+      region_size: 4.0
+      sample_spacing: 1.0
+      # Project observed voxels in this vertical band into the 2.5D evidence
+      # grid so a single moving LiDAR pass can populate stable topology cells.
+      evidence_vertical_tolerance: 0.50
+      min_clearance: 0.45
+      max_clearance: 2.5
+      connection_radius: 1.75
+      dirty_padding: 0.0
+      bubble_overlap_margin: 0.10
+      max_nodes_per_region: 32
+      max_bubbles_per_region: 256
+      max_neighbors: 8
+    altitude_guard_enable: true
+    altitude_band: 0.25
+    altitude_escape_enable: true
+    altitude_escape_band: 3.5
+    # Fresh A* guides stop an optimized z dip from becoming the next guide
+    # prefix. The hard post-solve check uses the same one-sided 5 cm margin as
+    # the ExpTrajOpt continuous z-lower objective below.
+    z_lower_guard_enable: true
+    z_lower_guard_tolerance: 0.05
+    z_lower_guard_sample_dt: 0.02
+    replan_use_command_guide: false
+    over_goal_guard_enable: true
+    over_goal_tolerance: 0.25
+    near_goal_radius: 2.0
+    accept_exp_without_backup_near_goal: true
+  unknown_goal_reveal_en: true
+  yaw_dot_max: 3.0
+  # Yaw mode: 1 heading to velocity, 2 heading to goal
+  yaw_mode: 1
+  mpc_horizon: 15
+
+
+traj_opt:
+  switch:
+    save_log_en: false
+    # Keep per-optimization details in CSV; print only the final aggregate summary.
+    print_optimizer_log: false
+
+  boundary:
+    max_vel: 15.0
+    max_acc: 20.0
+    max_jerk: 120.0
+    max_omg: 3.5
+    max_tilt: 1.05
+    max_acc_thr: 22.0
+    min_acc_thr: 6.0
+    penna_margin: 0.05
+
+  exp_traj:
+    # 1 for xi 2 for pos
+    pos_constraint_type: 1
+    energy_cost_type: 4
+    block_energy_cost: false
+    opt_accuracy: 5.0e-6
+    # Shared LBFGS fast path for the ordinary state2state ExpTrajOpt. It is
+    # representation-independent and therefore applies to both dense and
+    # fixed-depth convex-hull objectives.
+    lbfgs_fast_en: true
+    lbfgs_mem_size: 32
+    lbfgs_step_bound_en: false
+    lbfgs_time_ratio_min: 0.5
+    lbfgs_time_ratio_max: 2.0
+    lbfgs_fast_window: 3
+    lbfgs_fast_min_iterations: 10
+    lbfgs_fast_consecutive: 1
+    lbfgs_fast_rel_cost: 1.0e-3
+    lbfgs_fast_rel_step: 2.0e-2
+    lbfgs_fast_rel_penalty: 5.0e-2
+    # Keep the stable fast-stop rule based on objective/decision-step/penalty
+    # changes. The phase-0 raw-gradient guard is scale-sensitive under the
+    # large corridor weights and otherwise prevents nearly every fast stop.
+    # Continuous-time feasibility is checked independently by the certificate.
+    lbfgs_fast_phase0_guards_en: false
+    lbfgs_fast_rel_time: 2.0e-2
+    lbfgs_fast_rel_waypoint: 2.0e-2
+    lbfgs_fast_scaled_grad: 5.0e-2
+    lbfgs_fast_min_step: 1.0e-8
+    lbfgs_fast_penalty_tol: 1.0e-2
+    lbfgs_fast_small_step_limit: 3
+    # Reuse the previous successful physical MINCO solution only when it is
+    # compatible with the new corridor. The fresh guide seed and cached seed
+    # are evaluated with the same real objective; the cached seed wins only
+    # when it improves the guide cost by at least 25%.
+    lbfgs_warm_start_en: true
+    lbfgs_warm_start_max_endpoint_shift: 3.0
+    lbfgs_warm_start_max_waypoint_shift: 2.0
+    lbfgs_warm_start_duration_blend: 0.75
+    lbfgs_warm_start_cost_ratio: 0.75
+    lbfgs_warm_start_gradient_ratio: 1.0
+    lbfgs_warm_start_penalty_ratio: 1.0
+    # Preserve the timing of the already feasible guide trajectory. The old
+    # implicit 0.8 scale manufactured dynamic violations before every solve.
+    guide_initial_time_scale: 1.0
+    scale_factor: 1.0
+    integral_reso: 15
+    # Representation selection. All convex-hull formulation parameters and its
+    # independent penalty weights live in the dedicated profile below.
+    # Set false to run dense using only the penna_* block in this file.
+    convex_hull_en: true
+    convex_hull_config: "traj_opt/convex_hull/click_real_highspeed.yaml"
+    smooth_eps: 0.01
+    # Dense-integral-only penalty set. It is ignored by the convex-hull
+    # polynomial/control-point terms whenever the profile above is active.
+    penna_t: 2.0e+5
+    penna_pos: 5.0e+7
+    penna_vel: 1.0e+7
+    penna_acc: 1.0e+7
+    # penna_jerk <= 0 disables both the penalty and continuous jerk certificate.
+    penna_jerk: -1.0e+5
+    penna_attract: 1.0e+3
+    penna_guide_path: 0.0
+    guide_path_tube_radius: 0.05
+    guide_path_z_tube_radius: 0.05
+    guide_path_huber_delta: 0.40
+    guide_path_time_gradient_en: false
+    penna_guide_z_tube: 1.0e+7
+    # One-sided lower bound: z may rise for clearance, but may not fall more
+    # than 5 cm below the time-aligned frontend guide.
+    guide_z_tube_radius: 0.05
+    penna_omg: 5.0e+6
+    penna_thr: 2.0e+6
+
+  backup_traj:
+    uniform_time_en: true
+    pos_constraint_type: 1
+    piece_num: 2
+    energy_cost_type: 4
+    block_energy_cost: false
+    opt_accuracy: 1.0e-6
+    scale_factor: 1.0
+    integral_reso: 12
+    smooth_eps: 0.01
+    penna_t: 5.0e+4
+    penna_ts: 1.0e+6
+    penna_pos: 1.0e+8
+    penna_vel: 1.0e+7
+    penna_acc: 1.0e+7
+    penna_jerk: -1.0e+7
+    penna_guide_z_tube: 5.0e+6
+    guide_z_tube_radius: 0.00
+    penna_omg: 5.0e+6
+    penna_thr: 2.0e+6
+
+  esdf_traj:
+    block_energy_cost: false
+    opt_accuracy: 5.0e-6
+    integral_reso: 15
+    smooth_eps: 0.01
+    penna_t: 12000.0
+    penna_pos: 5.0e+6
+    penna_vel: 5.0e+5
+    penna_acc: 5.0e+5
+    penna_jerk: 5.0e+5
+    penna_omg: 5.0e+5
+    penna_thr: 1.0e+5
+
+  flatness:
+    mass: 1.64
+    dh: 0.35
+    dv: 0.35
+    cp: 0.001
+    v_eps: 0.0001
+    grav: 9.81
+
+
+astar:
+  map_voxel_num: [ 500, 500, 100 ]
+  visual_process: false
+  allow_diag: true
+  # 0 DIAG; 1 MANHATTAN; 2 EUCLIDEAN
+  heu_type: 2
+  debug_visualization_en: false
+
+
+rog_map:
+  resolution: 0.15
+  inflation_resolution: 0.15
+  inflation_step: 3
+  unk_inflation_en: false
+  unk_inflation_step: 1
+  map_size: [ 50,50,6 ]
+  # If the map rolling is disable, the map origin [m] should be set.
+  fix_map_origin: [ 0,0,1.5 ]
+  frontier_extraction_en: false
+
+  # Virtual ceil and ground
+  virtual_ceil_height: 5.5
+  virtual_ground_height: -0.1
+
+  load_pcd_en: false
+
+  map_sliding:
+    enable: true
+    # The minimum distance [m] to slide the map.
+    threshold: 0.3
+
+  esdf:
+    enable: false
+    resolution: 0.1
+    # The range of esdf around the odom [m].
+    local_update_box: [ 5,5,3 ]
+
+  # If [enable = true], the ROG-Map will actively take ros topic as input.
+  #  else user should call function [updateMap] to update the map.
+  ros_callback:
+    enable: true
+    cloud_topic: "/cloud_registered"
+    odom_topic: "/lidar_slam/odom"
+    odom_timeout: 2.0
+
+
+  visualization:
+    enable: true
+    # when enabled, use rqt_reconfigure to change the visualization parameters.
+    use_dynamic_reconfigure: false
+    # The rate of visualization [Hz], if set to 0, the visualization will not be triggered by frame.
+    time_rate: 2
+    # The frame rate of visualization [Hz], if set to 0, the visualization will not be triggered by frame.
+    frame_rate: 0
+    # visualization range along the odom [m].
+    range: [ 20, 20,4 ]
+    frame_id: "world"
+    pub_unknown_map_en: false
+
+  # Intensity filter for input point cloud. If the point intensity is less than this value,
+  # it will be ignored (to avoid noise like dusk).
+  intensity_thresh: -10
+  # The temporal downsample rate for input point cloud.
+  #  e.g. if set to k, the point cloud will be downsampled to 1/k.
+  point_filt_num: 1
+
+  # Probabilistc update
+  raycasting:
+    # if disable, the map will only maintain occupied information, and all other grid
+    # will be considered as unknown.
+    # Dense observed-free topology requires miss-ray integration; otherwise
+    # ROG contains OCCUPIED and UNKNOWN only and cannot supply KNOWN_FREE.
+    enable: true
+    batch_update_size: 1
+    local_update_box: [ 100,100,5 ]
+    # The range of raycasting [m].
+    ray_range: [0.5, 100 ]
+
+    p_min: 0.12
+    p_miss: 0.49
+    p_free: 0.499
+    p_occ: 0.85
+    p_hit: 0.9
+    p_max: 0.98
+    # The threshold of a non-occupied inf map grid to be considered as free. [0.0-1.0]
+    # for counter map, if each cell contains N cells in prob map, then only when
+    # N_unk > N * unk_thresh cells are unknown, the cell will be considered as unknown.
+    # example: 1) if unk_thresh is set 0.0, then once at least one cell in prob map is unknown,
+    #             the cell will be considered as unknown.
+    #         2) if unk_thresh is set to 1.0, then only all cells in prob map are unknown,
+    #             the cell will be considered as unknown.
+    # in all, 1.0 is more aggressive while 0.0 is more conservative.
+    unk_thresh: 1.0
