@@ -29,6 +29,7 @@
 
 #include "fsm/fsm.h"
 #include "ros_interface/ros_adapter_contract.hpp"
+#include "checker/common_checker.hpp"
 #include <map_manager/topology_graph_ros1.hpp>
 
 #include "ros/ros.h"
@@ -41,6 +42,13 @@
 #include "quadrotor_msgs/SO3Command.h"
 #include "std_msgs/String.h"
 #include "utils/geometry/quadrotor_flatness.hpp"
+#include <coverage/face_detector.hpp>
+#include <sfm_planner/CaptureRequest.h>
+#include <sfm_planner/CaptureResult.h>
+#include <sfm_planner/FaceDetectionRequest.h>
+#include <sfm_planner/FaceObservation.h>
+#include <sfm_planner/MissionStatus.h>
+#include <sfm_planner/StartInspection.h>
 
 #include <pcl_conversions/pcl_conversions.h>
 
@@ -72,7 +80,18 @@ namespace fsm {
         ros::Publisher cmd_pub, so3_cmd_pub_, mpc_cmd_pub_, path_pub_;
         ros::Publisher swarm_traj_pub_, swarm_state_pub_;
         ros::Publisher diagnostic_event_pub_;
+        ros::ServiceServer inspection_start_srv_;
+        ros::Subscriber face_observation_sub_;
+        ros::Subscriber capture_result_sub_;
+        ros::Subscriber inspection_cloud_sub_;
+        ros::Publisher face_request_pub_;
+        ros::Publisher face_debug_pub_;
+        ros::Publisher capture_request_pub_;
+        ros::Publisher mission_status_pub_;
         ros::Timer execution_timer_, replan_timer_, cmd_timer_, perception_safety_timer_;
+        std::unique_ptr<coverage::FaceDetector> face_detector_;
+        bool face_request_pending_{false};
+        mission::FaceDetectionRequest active_face_request_;
         quadrotor_msgs::PositionCommand pid_cmd_;
         rog_map::ROGMapROS::Ptr map_ptr_;
         general_planner::TopologyGraphROS1::Ptr topology_graph_ros1_;
@@ -264,6 +283,8 @@ namespace fsm {
             const double corridor_time = planner_ptr_->getLatestCorridorTime();
             const std::string state2state_z_debug =
                     state2stateMode() ? planner_ptr_->getLatestState2StateZDebugInfo() : "";
+            const std::string state2state_topology_debug =
+                    state2stateMode() ? planner_ptr_->getLatestState2StateTopologyDebugInfo() : "";
             const char *task_phase = "state_to_state";
             if (perchingMode()) {
                 task_phase = "perching";
@@ -297,7 +318,8 @@ namespace fsm {
                 << ";total_replan_time_ms=" << planner_ptr_->getLatestTotalReplanTime() * 1000.0
                 << ";trajectory_optimization_success=1"
                 << ";optimization_time_ms=" << planner_ptr_->getLatestOptimizationTime() * 1000.0
-                << state2state_z_debug;
+                << state2state_z_debug
+                << state2state_topology_debug;
             return oss.str();
         }
 
@@ -831,6 +853,23 @@ namespace fsm {
             general_utils::Vec3f goal_p = Vec3f{msg->pose.position.x, msg->pose.position.y, msg->pose.position.z};
             general_utils::Quatf goal_q = general_utils::Quatf{msg->pose.orientation.w, msg->pose.orientation.x,
                                                            msg->pose.orientation.y, msg->pose.orientation.z};
+            if (cfg_.inspection_mission.enable &&
+                cfg_.inspection_mission.trigger_from_2d_goal) {
+                if (!goal_p.allFinite() || !checker::quaternionValidOrDisabled(goal_q)) {
+                    ros_ptr_->warn(" -- [Inspection] Reject invalid 2D mission trigger.");
+                    return;
+                }
+                mission::MissionPose trigger;
+                trigger.position = Eigen::Vector3d(
+                        goal_p.x(), goal_p.y(), cfg_.click_height);
+                trigger.yaw = cfg_.click_yaw_en && goal_q.coeffs().allFinite()
+                                  ? geometry_utils::get_yaw_from_quaternion(goal_q)
+                                  : 0.0;
+                if (!startInspectionMission(&trigger)) {
+                    ros_ptr_->warn(" -- [Inspection] 2D mission trigger rejected.");
+                }
+                return;
+            }
             setGoalPosiAndYaw(goal_p, goal_q);
         }
 
@@ -842,6 +881,178 @@ namespace fsm {
                                                                 msg->pose.orientation.y,
                                                                 msg->pose.orientation.z};
             setGoalPosiAndYaw(goal_p, goal_q, GoalHeightMode::MESSAGE_HEIGHT);
+        }
+
+        bool startInspectionCallback(sfm_planner::StartInspection::Request &req,
+                                     sfm_planner::StartInspection::Response &res) {
+            (void)req;
+            const bool ok = startInspectionMission();
+            res.accepted = ok;
+            if (ok && inspection_mission_) {
+                res.mission_id = inspection_mission_->context().mission_id;
+                res.reason = "accepted";
+            } else {
+                res.mission_id = "";
+                res.reason = inspection_mission_ ? "rejected" : "inspection_disabled";
+            }
+            return true;
+        }
+
+        void faceObservationCallback(const sfm_planner::FaceObservationConstPtr &msg) {
+            mission::FaceObservation obs;
+            obs.mission_id = msg->mission_id;
+            obs.target_version = msg->target_version;
+            obs.request_id = msg->request_id;
+            obs.valid = msg->valid;
+            obs.center = Eigen::Vector3d(msg->center.x, msg->center.y, msg->center.z);
+            obs.normal = Eigen::Vector3d(msg->normal.x, msg->normal.y, msg->normal.z);
+            if (obs.normal.norm() > 1e-6) {
+                obs.normal.normalize();
+            }
+            obs.width = msg->width;
+            obs.height = msg->height;
+            obs.area = msg->area;
+            obs.confidence = msg->confidence;
+            obs.surface_cloud.reset(new pcl::PointCloud<pcl::PointXYZ>());
+            if (!msg->surface_cloud.data.empty()) {
+                pcl::fromROSMsg(msg->surface_cloud, *obs.surface_cloud);
+            }
+            onFaceObservation(obs);
+        }
+
+        void captureResultCallback(const sfm_planner::CaptureResultConstPtr &msg) {
+            mission::CaptureResult result;
+            result.mission_id = msg->mission_id;
+            result.target_version = msg->target_version;
+            result.request_id = msg->request_id;
+            result.viewpoint_id = msg->viewpoint_id;
+            result.success = msg->success;
+            result.image_id = msg->image_id;
+            result.reason = msg->reason;
+            onCaptureResult(result);
+        }
+
+        void inspectionCloudCallback(const sensor_msgs::PointCloud2ConstPtr &msg) {
+            if (!cfg_.inspection_mission.enable ||
+                !cfg_.inspection_mission.use_internal_detector ||
+                !face_request_pending_ ||
+                !face_detector_ ||
+                !inspection_mission_ ||
+                !inspectionMissionActive()) {
+                return;
+            }
+            pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
+            pcl::fromROSMsg(*msg, *cloud);
+            const auto mission_context = inspection_mission_->context();
+            const auto &active = mission_context.active_target;
+            // The approach goal is the operator's initial observation anchor.
+            // Its yaw, rather than a face from a previous inspection, defines
+            // the first detection ROI.  Otherwise a persisted old face can
+            // make a newly triggered mission search in the wrong direction.
+            Eigen::Vector3d tunnel_dir(std::cos(active.goal_yaw),
+                                       std::sin(active.goal_yaw), 0.0);
+            if (!std::isfinite(active.goal_yaw) || tunnel_dir.norm() < 1e-6) {
+                tunnel_dir = Eigen::Vector3d::UnitX();
+            }
+            const Eigen::Vector3d robot(robot_state_.p.x(), robot_state_.p.y(),
+                                        robot_state_.p.z());
+            // Priors are optional.  An initial/manual target has no verified
+            // face geometry, so disabled prior gates must not feed placeholder
+            // values into the detector.
+            const Eigen::Vector3d *prior_center =
+                    active.face_prior_valid &&
+                            cfg_.inspection_mission.face_prior_center_tolerance > 0.0
+                            ? &active.face_center
+                            : nullptr;
+            const Eigen::Vector3d *prior_normal =
+                    active.face_prior_valid &&
+                            cfg_.inspection_mission.face_prior_normal_alignment_min > 0.0
+                            ? &active.face_normal
+                            : nullptr;
+            auto obs = face_detector_->process(cloud, robot, tunnel_dir,
+                                               prior_center, prior_normal);
+            if (!obs.valid) {
+                return;
+            }
+            obs.mission_id = active_face_request_.mission_id;
+            obs.target_version = active_face_request_.target_version;
+            obs.request_id = active_face_request_.request_id;
+            if (face_debug_pub_) {
+                sfm_planner::FaceObservation debug;
+                debug.header = msg->header;
+                debug.mission_id = obs.mission_id;
+                debug.target_version = obs.target_version;
+                debug.request_id = obs.request_id;
+                debug.valid = obs.valid;
+                debug.center.x = obs.center.x();
+                debug.center.y = obs.center.y();
+                debug.center.z = obs.center.z();
+                debug.normal.x = obs.normal.x();
+                debug.normal.y = obs.normal.y();
+                debug.normal.z = obs.normal.z();
+                debug.width = obs.width;
+                debug.height = obs.height;
+                debug.area = obs.area;
+                debug.confidence = obs.confidence;
+                if (obs.surface_cloud && !obs.surface_cloud->empty()) {
+                    pcl::toROSMsg(*obs.surface_cloud, debug.surface_cloud);
+                    debug.surface_cloud.header = msg->header;
+                }
+                face_debug_pub_.publish(debug);
+            }
+            face_request_pending_ = false;
+            onFaceObservation(obs);
+        }
+
+        void publishFaceDetectionRequest(const mission::FaceDetectionRequest &request) override {
+            face_request_pending_ = true;
+            active_face_request_ = request;
+            if (face_detector_) {
+                face_detector_->reset();
+            }
+            if (face_request_pub_) {
+                sfm_planner::FaceDetectionRequest msg;
+                msg.header.stamp = ros::Time::now();
+                msg.mission_id = request.mission_id;
+                msg.target_version = request.target_version;
+                msg.request_id = request.request_id;
+                face_request_pub_.publish(msg);
+            }
+        }
+
+        void publishCaptureRequest(const mission::CaptureCommand &request) override {
+            if (!capture_request_pub_) {
+                return;
+            }
+            sfm_planner::CaptureRequest msg;
+            msg.header.stamp = ros::Time::now();
+            msg.mission_id = request.mission_id;
+            msg.target_version = request.target_version;
+            msg.request_id = request.request_id;
+            msg.viewpoint_id = request.viewpoint.id;
+            msg.position.x = request.viewpoint.position.x();
+            msg.position.y = request.viewpoint.position.y();
+            msg.position.z = request.viewpoint.position.z();
+            msg.body_yaw = request.viewpoint.body_yaw;
+            msg.camera_pitch = request.viewpoint.camera_pitch;
+            capture_request_pub_.publish(msg);
+        }
+
+        void publishMissionStatus(const mission::MissionStatusInfo &status) override {
+            if (!mission_status_pub_) {
+                return;
+            }
+            sfm_planner::MissionStatus msg;
+            msg.header.stamp = ros::Time::now();
+            msg.mission_id = status.mission_id;
+            msg.state = mission::toString(status.state);
+            msg.viewpoint_index = status.viewpoint_index;
+            msg.viewpoint_count = status.viewpoint_count;
+            msg.target_version = status.target_version;
+            msg.has_pending_target = status.has_pending_target;
+            msg.detail = status.detail;
+            msg.failure_reason = status.failure_reason;
+            mission_status_pub_.publish(msg);
         }
 
         bool subscribe3DGoal(const uint32_t queue_size,
@@ -1390,6 +1601,61 @@ namespace fsm {
                 cmd_cnt++;
             }
 
+            if (cfg_.inspection_mission.enable) {
+                inspection_start_srv_ = nh_.advertiseService(
+                        cfg_.inspection_mission.start_service,
+                        &FsmRos1::startInspectionCallback, this);
+                face_request_pub_ = nh_.advertise<sfm_planner::FaceDetectionRequest>(
+                        cfg_.inspection_mission.face_request_topic, 1);
+                face_debug_pub_ = nh_.advertise<sfm_planner::FaceObservation>(
+                        cfg_.inspection_mission.face_debug_topic, 1);
+                capture_request_pub_ = nh_.advertise<sfm_planner::CaptureRequest>(
+                        cfg_.inspection_mission.capture_request_topic, 10);
+                mission_status_pub_ = nh_.advertise<sfm_planner::MissionStatus>(
+                        cfg_.inspection_mission.status_topic, 10);
+                face_observation_sub_ = nh_.subscribe(
+                        cfg_.inspection_mission.face_result_topic, 10,
+                        &FsmRos1::faceObservationCallback, this);
+                capture_result_sub_ = nh_.subscribe(
+                        cfg_.inspection_mission.capture_result_topic, 10,
+                        &FsmRos1::captureResultCallback, this);
+                if (cfg_.inspection_mission.use_internal_detector) {
+                    coverage::FaceDetector::Config det_cfg;
+                    det_cfg.forward_min = cfg_.inspection_mission.face_forward_min;
+                    det_cfg.forward_max = cfg_.inspection_mission.face_forward_max;
+                    det_cfg.min_confidence = cfg_.inspection_mission.face_min_confidence;
+                    det_cfg.min_area = cfg_.inspection_mission.face_min_area;
+                    det_cfg.min_points = cfg_.inspection_mission.face_min_points;
+                    det_cfg.normal_alignment_min =
+                            cfg_.inspection_mission.face_normal_alignment_min;
+                    det_cfg.voxel_leaf = cfg_.inspection_mission.face_voxel_leaf;
+                    det_cfg.stability_frames = cfg_.inspection_mission.face_stability_frames;
+                    det_cfg.stability_center_tol =
+                            cfg_.inspection_mission.face_stability_center_tol;
+                    det_cfg.stability_normal_tol =
+                            cfg_.inspection_mission.face_stability_normal_tol;
+                    det_cfg.cluster_tolerance = cfg_.inspection_mission.face_cluster_tolerance;
+                    det_cfg.cluster_min_size = cfg_.inspection_mission.face_cluster_min_size;
+                    det_cfg.ransac_dist = cfg_.inspection_mission.face_ransac_dist;
+                    det_cfg.prior_center_tolerance =
+                            cfg_.inspection_mission.face_prior_center_tolerance;
+                    det_cfg.prior_normal_alignment_min =
+                            cfg_.inspection_mission.face_prior_normal_alignment_min;
+                    face_detector_ = std::make_unique<coverage::FaceDetector>(det_cfg);
+                    inspection_cloud_sub_ = nh_.subscribe(
+                            cfg_.inspection_mission.cloud_topic, 1,
+                            &FsmRos1::inspectionCloudCallback, this);
+                }
+                if (cmd_cnt == 0) {
+                    cmd_cnt = 1;
+                }
+                cout << YELLOW << " -- [Fsm] INSPECTION MISSION ENABLE: start "
+                     << cfg_.inspection_mission.start_service
+                     << ", mock_face=" << cfg_.inspection_mission.mock_face_detection
+                     << ", mock_capture=" << cfg_.inspection_mission.mock_capture
+                     << RESET << endl;
+            }
+
             if (cmd_cnt != 1) {
                 cout << YELLOW << " -- [Fsm] CMD INPUT ERROR." << RESET << endl;
                 exit(0);
@@ -1522,6 +1788,8 @@ namespace fsm {
                                       -1,
                                       0);
             }
+            initInspectionMissionPlanner();
+
             if (cfg_.auto_start) {
                 started_ = true;
                 if (explorationMode()) {

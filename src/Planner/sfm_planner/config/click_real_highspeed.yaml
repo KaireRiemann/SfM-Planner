@@ -64,34 +64,29 @@ general_planner:
       enable: true
       # Build, record and visualize only. Keep topology completely outside the
       # latency-sensitive state2state frontend.
-      query_enable: false
-      # Persistent, globally aligned dense roadmap over sensor-observed free
-      # space. Unknown cells and planned-but-unobserved routes are excluded.
-      construction_mode: dense_known_free
-      # State2state in this profile navigates inside a narrow inflated height
-      # band. Sample the sensor-observed plane at the actual flight/LiDAR
-      # height; the virtual-height midpoint is not necessarily observed.
-      planar_mode: true
+      query_capability_enable: false
+      # Sparse persistent 3D skeleton over sensor-observed global free space.
+      construction_mode: persistent_bubble_skeleton
+      planar_mode: false
       navigation_altitude: 1.5
       unknown_as_free: false
       min_query_distance: 3.0
-      # Four 4x4 m regions at 20 Hz can follow a fast moving observation
-      # window, while RViz receives a bounded 2 Hz immutable snapshot.
-      update_budget: 4
+      # Dirty regions nearest to current odom are consumed asynchronously.
+      update_budget: 8
       update_period: 0.05
-      publish_period: 0.50
+      publish_period: 0.20
       region_size: 4.0
-      sample_spacing: 1.0
-      # Project observed voxels in this vertical band into the 2.5D evidence
-      # grid so a single moving LiDAR pass can populate stable topology cells.
-      evidence_vertical_tolerance: 0.50
-      min_clearance: 0.45
+      sample_spacing: 0.8
+      min_clearance: 0.20
       max_clearance: 2.5
-      connection_radius: 1.75
-      dirty_padding: 0.0
+      candidate_separation: 1.5
+      stable_match_distance: 1.0
+      connection_radius: 6.0
+      edge_sample_spacing: 0.20
+      dirty_padding: 2.5
       bubble_overlap_margin: 0.10
-      max_nodes_per_region: 32
-      max_bubbles_per_region: 256
+      max_nodes_per_region: 12
+      max_bubbles_per_region: 192
       max_neighbors: 8
     altitude_guard_enable: true
     altitude_band: 0.25
@@ -339,3 +334,63 @@ rog_map:
     #             the cell will be considered as unknown.
     # in all, 1.0 is more aggressive while 0.0 is more conservative.
     unk_thresh: 1.0
+
+inspection_mission:
+  enable: false
+  navigation_only: false
+  auto_start: false
+  trigger_from_2d_goal: false
+  skip_face_detection: false
+  use_target_nav_goal_directly: true
+  allow_mock_coverage_fallback: false
+  mock_external: true
+  mock_face_detection: true
+  mock_capture: true
+  use_internal_detector: false
+  apply_change_region_mask: true
+  target_file: "config/mission_target.yaml"
+  start_service: "/inspection/start"
+  face_request_topic: "/inspection/face/request"
+  face_result_topic: "/inspection/face/result"
+  face_debug_topic: "/inspection/face/debug"
+  capture_request_topic: "/inspection/capture/request"
+  capture_result_topic: "/inspection/capture/result"
+  status_topic: "/inspection/status"
+  cloud_topic: "/cloud_registered"
+  home_mode: "capture_on_trigger"
+  approach_distance_min: 2.0
+  approach_distance_max: 4.0
+  approach_distance_step: 0.2
+  safe_radius: 0.6
+  flight_height_min: 0.5
+  flight_height_max: 5.0
+  change_region_thickness: 1.0
+  fail_retry_count: 1
+  face_result_timeout_sec: 15.0
+  capture_result_timeout_sec: 10.0
+  face:
+    forward_min: 1.0
+    forward_max: 12.0
+    min_confidence: 0.75
+    min_area: 4.0
+    min_points: 300
+    normal_alignment_min: 0.8
+    voxel_leaf: 0.1
+    cluster_tolerance: 0.35
+    cluster_min_size: 200
+    ransac_dist: 0.08
+    stability_frames: 3
+    stability_center_tol: 0.35
+    stability_normal_tol: 0.15
+    prior_center_tolerance: 3.0
+    prior_normal_alignment_min: 0.9
+  coverage:
+    camera_hfov_deg: 70.0
+    camera_vfov_deg: 50.0
+    capture_distance: 4.0
+    image_overlap: 0.7
+    min_observation_count: 2
+    min_baseline_angle_deg: 8.0
+    max_incidence_angle_deg: 60.0
+    surface_sample_resolution: 0.4
+    min_predicted_coverage: 0.95

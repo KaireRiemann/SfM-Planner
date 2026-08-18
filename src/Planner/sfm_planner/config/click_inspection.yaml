@@ -1,0 +1,496 @@
+fsm:
+  click_goal_en: true
+  click_goal_topic: "/goal"
+  click_goal_3d_en: true
+  click_goal_3d_topic: "/goal_3d"
+  click_height: 1.5
+  click_yaw_en: true
+  # Inspection views are static and adjacent captures can be < 1 m apart.
+  # A moderate rolling-replan rate leaves the optimizer a clean planning slot
+  # for each short capture-to-capture leg while retaining obstacle updates.
+  replan_rate: 2.0
+  cmd_topic: "/planning/pos_cmd"
+  mpc_cmd_topic: "/planning_cmd/poly_traj"
+  timer_en: true
+  perception_replan_check_rate: 60.0
+  perception_replan_check_horizon: 2.0
+  perception_replan_check_dt: 0.06
+  perception_replan_min_interval: 0.08
+  perception_replan_consecutive_hits: 1
+  perception_replan_emergency_horizon: 0.45
+  # GENERATE_TRAJ runs at 100 Hz. A small consecutive-failure count therefore
+  # aborts an inspection approach before the local map exists. Inspection uses
+  # a wall-clock budget instead; the count below only applies to click goals.
+  state2state_plan_from_rest_max_failures: 40
+  # The approach and return legs may need map evidence to arrive.  A capture
+  # leg is different: it is a short, static move on an already built map, so
+  # do not spin on the same numerical failure for the full approach budget.
+  state2state_plan_from_rest_max_failure_sec: 25.0
+  state2state_inspection_capture_max_failure_sec: 8.0
+  state2state_inspection_retry_backoff_initial_sec: 0.20
+  state2state_inspection_retry_backoff_max_sec: 1.00
+  # Capture viewpoints are image-acquisition poses.  Do not reuse the
+  # 15 m/s long-range navigation profile for their sub-metre transitions.
+  state2state_inspection_capture_max_vel: 1.5
+  state2state_inspection_capture_max_acc: 1.5
+  state2state_inspection_capture_max_jerk: 6.0
+  state2state_clear_goal_on_plan_failure: true
+
+general_planner:
+  backup_traj_en: true
+  esdf_traj_en: false
+  esdf_safe_distance: 0.3
+  detailed_log_en: false
+  visualization_en: true
+  use_fov_cut: false
+  print_log: false
+  visual_process: false
+  frontend_in_known_free: false
+  # The inspection anchor and every coverage viewpoint carry a viewing yaw.
+  # Enable the terminal yaw constraint so capture never occurs side-on.
+  goal_yaw_en: true
+  goal_vel_en: false
+  corridor_bound_dis: 2.0
+  corridor_line_max_length: 2.0
+  safe_corridor_line_max_length: 15.0
+  iris_iter_num: 2
+  ellipsoid_optimizer: classic
+  ellipsoid_optimizer_fallback: false
+  obs_skip_num: 2
+  replan_forward_dt: 0.1
+  planning_horizon: 15.0
+  sensing_horizon: -1
+  receding_dis: 8.0
+  robot_r: 0.2
+  frontend_astar_time_out: 0.35
+  over_wall_search_en: true
+  over_wall_max_climb: 3.0
+  over_wall_height_step: 0.3
+  over_wall_min_blocked_span: 0.8
+  over_wall_min_progress_gain: 0.5
+  over_wall_forward_ratio: 0.9
+  dynamic_obstacle_layer:
+    enable: false
+    cloud_topic: "/cloud_registered"
+    cloud_queue_size: 3
+    odom_timeout: 0.2
+    ttl: 0.35
+    voxel_size: 0.20
+    inflation_radius: 0.40
+    line_check_step: 0.05
+    max_points_per_frame: 30000
+    local_half_size: [ 12, 12, 3 ]
+  state2state:
+    direct_line_frontend_enable: true
+    topology:
+      enable: true
+      # Graph construction stays on for the whole state2state mission.
+      # Query/consume it only on RETURN_HOME: global topo A* once, then a
+      # local prefix / A* repair. Approach and viewpoints stay local-only.
+      query_capability_enable: true
+      # Sparse persistent 2.5D skeleton over sensor-observed global free
+      # space.  Cave inspection flies at a fixed altitude; using 3-D bubbles
+      # makes a thin LiDAR free-space band fail vertical-clearance sampling.
+      construction_mode: persistent_bubble_skeleton
+      planar_mode: true
+      navigation_altitude: 1.5
+      unknown_as_free: false
+      min_query_distance: 3.0
+      local_prefix_length: 8.0
+      local_boundary_margin: 0.8
+      route_rejoin_max_candidates: 3
+      route_deviation_requery_distance: 1.0
+      route_query_min_interval: 0.5
+      # RETURN_HOME accepts only a route that reaches Home.  When the sparse
+      # topo graph is incomplete, retrace the map-verified outward corridor;
+      # never turn a progress-only topo anchor into a direct local flight.
+      home_require_complete_route: true
+      breadcrumb_enable: true
+      breadcrumb_spacing: 0.5
+      breadcrumb_max_segment: 1.0
+      breadcrumb_attach_radius: 1.5
+      breadcrumb_max_points: 2000
+      # Dirty regions nearest to current odom are consumed asynchronously.
+      # Tunnel evidence is cheap (voxel seeds, no empty octree), so a larger
+      # budget can keep up with a 15 m/s transit.
+      update_budget: 16
+      update_period: 0.05
+      publish_period: 0.20
+      region_size: 4.0
+      sample_spacing: 0.8
+      # Nodes still require KNOWN_FREE and inflated-safe edges; 0.20 m lets
+      # first-pass LiDAR ray evidence seed the graph at robot-radius clearance.
+      min_clearance: 0.20
+      max_clearance: 2.5
+      # Sparse 2.5-D tunnel skeleton.  Keep portal representatives on the
+      # four region faces, but reject redundant nodes from adjacent regions.
+      candidate_separation: 2.0
+      stable_match_distance: 1.0
+      # 4.5 m still bridges adjacent 4 m regions through their portal nodes;
+      # 6 m created many redundant cross-region shortcuts.
+      connection_radius: 4.5
+      edge_sample_spacing: 0.20
+      # Rebuild the neighbouring 2-D cells as well, so portal nodes and edges
+      # crossing a 4 m region boundary are refreshed together.  In planar
+      # mode this is a 3x3 window, not a 27-cell 3-D rebuild.
+      dirty_padding: 0.8
+      bubble_overlap_margin: 0.10
+      max_nodes_per_region: 6
+      max_bubbles_per_region: 64
+      # This is a real undirected degree bound for new skeleton edges.  Four
+      # keeps forward/backward tunnel connectivity plus junction alternatives.
+      max_neighbors: 4
+    altitude_guard_enable: true
+    altitude_band: 0.25
+    altitude_escape_enable: true
+    altitude_escape_band: 3.5
+    # A fresh A* guide prevents a previous command's altitude excursion from
+    # becoming the next seed. It is a spatial reference only; ExpTrajOpt never
+    # uses it as a time-synchronised post-solve rejection condition.
+    replan_use_command_guide: false
+    over_goal_guard_enable: true
+    over_goal_tolerance: 0.25
+    near_goal_radius: 2.0
+    accept_exp_without_backup_near_goal: true
+  unknown_goal_reveal_en: true
+  yaw_dot_max: 3.0
+  # Yaw mode: 1 heading to velocity, 2 heading to goal
+  yaw_mode: 1
+  mpc_horizon: 15
+
+
+traj_opt:
+  switch:
+    save_log_en: false
+    # Keep per-optimization details in CSV; print only the final aggregate summary.
+    print_optimizer_log: false
+
+  boundary:
+    max_vel: 15.0
+    max_acc: 20.0
+    max_jerk: 120.0
+    max_omg: 3.5
+    max_tilt: 1.05
+    max_acc_thr: 22.0
+    min_acc_thr: 6.0
+    penna_margin: 0.05
+
+  exp_traj:
+    # 1 for xi 2 for pos
+    pos_constraint_type: 1
+    energy_cost_type: 4
+    block_energy_cost: false
+    opt_accuracy: 5.0e-6
+    # Shared LBFGS fast path for the ordinary state2state ExpTrajOpt. It is
+    # representation-independent and therefore applies to both dense and
+    # fixed-depth convex-hull objectives.
+    lbfgs_fast_en: true
+    lbfgs_mem_size: 32
+    # Bound a single line-search update in physical duration space.  This is
+    # important for sub-metre capture-to-capture motions whose time variables
+    # otherwise produce an ill-conditioned first L-BFGS step.
+    lbfgs_step_bound_en: true
+    lbfgs_time_ratio_min: 0.5
+    lbfgs_time_ratio_max: 2.0
+    lbfgs_fast_window: 3
+    lbfgs_fast_min_iterations: 10
+    lbfgs_fast_consecutive: 1
+    lbfgs_fast_rel_cost: 1.0e-3
+    lbfgs_fast_rel_step: 2.0e-2
+    lbfgs_fast_rel_penalty: 5.0e-2
+    # Keep the stable fast-stop rule based on objective/decision-step/penalty
+    # changes. The phase-0 raw-gradient guard is scale-sensitive under the
+    # large corridor weights and otherwise prevents nearly every fast stop.
+    # Continuous-time feasibility is checked independently by the certificate.
+    lbfgs_fast_phase0_guards_en: false
+    lbfgs_fast_rel_time: 2.0e-2
+    lbfgs_fast_rel_waypoint: 2.0e-2
+    lbfgs_fast_scaled_grad: 5.0e-2
+    lbfgs_fast_min_step: 1.0e-8
+    lbfgs_fast_penalty_tol: 1.0e-2
+    lbfgs_fast_small_step_limit: 3
+    # Reuse the previous successful physical MINCO solution only when it is
+    # compatible with the new corridor. The fresh guide seed and cached seed
+    # are evaluated with the same real objective; the cached seed wins only
+    # when it improves the guide cost by at least 25%.
+    lbfgs_warm_start_en: true
+    lbfgs_warm_start_max_endpoint_shift: 3.0
+    lbfgs_warm_start_max_waypoint_shift: 2.0
+    lbfgs_warm_start_duration_blend: 0.75
+    lbfgs_warm_start_cost_ratio: 0.75
+    lbfgs_warm_start_gradient_ratio: 1.0
+    lbfgs_warm_start_penalty_ratio: 1.0
+    # Preserve the timing of the already feasible guide trajectory. The old
+    # implicit 0.8 scale manufactured dynamic violations before every solve.
+    guide_initial_time_scale: 1.0
+    scale_factor: 1.0
+    integral_reso: 15
+    # Representation selection. All convex-hull formulation parameters and its
+    # independent penalty weights live in the dedicated profile below.
+    # Set false to run dense using only the penna_* block in this file.
+    # The high-speed convex-hull optimizer is valuable for long transit legs,
+    # but its fixed-depth representation is ill-conditioned for the sub-metre
+    # repositioning moves of an inspection grid. Use the robust dense solver
+    # for this inspection profile.
+    convex_hull_en: false
+    convex_hull_config: "traj_opt/convex_hull/click_real_highspeed.yaml"
+    smooth_eps: 0.01
+    # Dense-integral-only penalty set. It is ignored by the convex-hull
+    # polynomial/control-point terms whenever the profile above is active.
+    penna_t: 2.0e+5
+    # The old position/dynamic weights were tuned for long high-speed legs.
+    # Their six-to-seven order scale gap to time cost makes short capture legs
+    # prone to L-BFGS line-search exhaustion.  These remain strong soft
+    # constraints; collision safety is still provided by the SFC.
+    penna_pos: 1.0e+7
+    penna_vel: 2.0e+6
+    penna_acc: 2.0e+6
+    # Unlike a transit leg, adjacent capture viewpoints start and end at rest.
+    # Keep jerk active so the optimizer retains the jerk-aware guide timing;
+    # the backend has a final time-rescaling guard for numerical outliers.
+    penna_jerk: 5.0e+5
+    penna_attract: 1.0e+3
+    penna_guide_path: 0.0
+    guide_path_tube_radius: 0.05
+    guide_path_z_tube_radius: 0.20
+    guide_path_huber_delta: 0.40
+    guide_path_time_gradient_en: false
+    penna_guide_z_tube: 5.0e+5
+    # Strong soft altitude floor. State2state starts from goal.z and lowers
+    # the reference only for map-confirmed low passages, so a drifted start
+    # cannot redefine the cruise height. This is never a hard reject.
+    guide_z_tube_radius: 0.20
+    penna_omg: 5.0e+6
+    penna_thr: 2.0e+6
+
+  backup_traj:
+    uniform_time_en: true
+    pos_constraint_type: 1
+    piece_num: 2
+    energy_cost_type: 4
+    block_energy_cost: false
+    opt_accuracy: 1.0e-6
+    scale_factor: 1.0
+    integral_reso: 12
+    smooth_eps: 0.01
+    penna_t: 5.0e+4
+    penna_ts: 1.0e+6
+    penna_pos: 1.0e+8
+    penna_vel: 1.0e+7
+    penna_acc: 1.0e+7
+    penna_jerk: -1.0e+7
+    penna_guide_z_tube: 5.0e+6
+    guide_z_tube_radius: 0.00
+    penna_omg: 5.0e+6
+    penna_thr: 2.0e+6
+
+  esdf_traj:
+    block_energy_cost: false
+    opt_accuracy: 5.0e-6
+    integral_reso: 15
+    smooth_eps: 0.01
+    penna_t: 12000.0
+    penna_pos: 5.0e+6
+    penna_vel: 5.0e+5
+    penna_acc: 5.0e+5
+    penna_jerk: 5.0e+5
+    penna_omg: 5.0e+5
+    penna_thr: 1.0e+5
+
+  flatness:
+    mass: 1.64
+    dh: 0.35
+    dv: 0.35
+    cp: 0.001
+    v_eps: 0.0001
+    grav: 9.81
+
+
+astar:
+  map_voxel_num: [ 500, 500, 100 ]
+  visual_process: false
+  allow_diag: true
+  # 0 DIAG; 1 MANHATTAN; 2 EUCLIDEAN
+  heu_type: 2
+  debug_visualization_en: false
+
+
+rog_map:
+  resolution: 0.15
+  inflation_resolution: 0.15
+  inflation_step: 3
+  unk_inflation_en: false
+  unk_inflation_step: 1
+  # Keep the 16 m window and 10.5 m ceiling for coverage. The face is ~8.5 m
+  # tall and flight_height_max is 9.5 m; click-demo's 6 m / 2.5 m band would
+  # clip the upper viewpoints. Topology must not rely on shrinking this box:
+  # it follows LiDAR evidence in the current cell instead of octree-scanning
+  # the whole rolling volume.
+  map_size: [ 50,50,16 ]
+  # If the map rolling is disable, the map origin [m] should be set.
+  fix_map_origin: [ 0,0,1.5 ]
+  frontier_extraction_en: false
+
+  # Virtual ceil and ground
+  # cave1's detected face spans roughly z=[-0.3, 8.5] m.  Keep enough
+  # vertical free space for the upper coverage viewpoints; collision safety
+  # is still enforced by the inflated occupancy map and safe_radius.
+  virtual_ceil_height: 10.5
+  virtual_ground_height: -0.1
+
+  load_pcd_en: false
+
+  map_sliding:
+    enable: true
+    # The minimum distance [m] to slide the map.
+    threshold: 0.3
+
+  esdf:
+    enable: false
+    resolution: 0.1
+    # The range of esdf around the odom [m].
+    local_update_box: [ 5,5,3 ]
+
+  # If [enable = true], the ROG-Map will actively take ros topic as input.
+  #  else user should call function [updateMap] to update the map.
+  ros_callback:
+    enable: true
+    cloud_topic: "/cloud_registered"
+    odom_topic: "/lidar_slam/odom"
+    odom_timeout: 2.0
+
+
+  visualization:
+    enable: true
+    # when enabled, use rqt_reconfigure to change the visualization parameters.
+    use_dynamic_reconfigure: false
+    # The rate of visualization [Hz], if set to 0, the visualization will not be triggered by frame.
+    time_rate: 2
+    # The frame rate of visualization [Hz], if set to 0, the visualization will not be triggered by frame.
+    frame_rate: 0
+    # visualization range along the odom [m].
+    range: [ 20, 20,4 ]
+    frame_id: "world"
+    pub_unknown_map_en: false
+
+  # Intensity filter for input point cloud. If the point intensity is less than this value,
+  # it will be ignored (to avoid noise like dusk).
+  intensity_thresh: -10
+  # The temporal downsample rate for input point cloud.
+  #  e.g. if set to k, the point cloud will be downsampled to 1/k.
+  point_filt_num: 1
+
+  # Probabilistc update
+  raycasting:
+    # if disable, the map will only maintain occupied information, and all other grid
+    # will be considered as unknown.
+    # Dense observed-free topology requires miss-ray integration; otherwise
+    # ROG contains OCCUPIED and UNKNOWN only and cannot supply KNOWN_FREE.
+    enable: true
+    batch_update_size: 1
+    local_update_box: [ 100,100,5 ]
+    # The range of raycasting [m].
+    ray_range: [0.5, 100 ]
+
+    p_min: 0.12
+    p_miss: 0.49
+    p_free: 0.499
+    p_occ: 0.85
+    p_hit: 0.9
+    p_max: 0.98
+    # The threshold of a non-occupied inf map grid to be considered as free. [0.0-1.0]
+    # for counter map, if each cell contains N cells in prob map, then only when
+    # N_unk > N * unk_thresh cells are unknown, the cell will be considered as unknown.
+    # example: 1) if unk_thresh is set 0.0, then once at least one cell in prob map is unknown,
+    #             the cell will be considered as unknown.
+    #         2) if unk_thresh is set to 1.0, then only all cells in prob map are unknown,
+    #             the cell will be considered as unknown.
+    # in all, 1.0 is more aggressive while 0.0 is more conservative.
+    unk_thresh: 1.0
+
+inspection_mission:
+  enable: true
+  # Complete inspection flow: fly to the preconfigured nav_goal, detect the
+  # face, plan planar viewpoints, capture, then return to the recorded home.
+  navigation_only: false
+  # Task begins only when /inspection/start is called.
+  auto_start: false
+  trigger_from_2d_goal: false
+  skip_face_detection: false
+  use_target_nav_goal_directly: true
+  allow_mock_coverage_fallback: false
+  # Use MaRSIM /cloud_registered for face detection, but retain a simulated
+  # camera acknowledgement so this LiDAR-only integration test can complete.
+  mock_external: false
+  mock_face_detection: false
+  mock_capture: true
+  use_internal_detector: true
+  # The initial cave1 target below is a manual observation anchor, not a
+  # previously confirmed blast face.  Do not erase its forward surface.
+  apply_change_region_mask: false
+  # This launch profile follows click_cave1.launch and uses cave1.pcd.  Keep
+  # the production Qingyuan prior in mission_target.yaml untouched; the
+  # simulation target below is calibrated from cave1.pcd instead.
+  target_file: "config/mission_target_marsim_cave1.yaml"
+  start_service: "/inspection/start"
+  face_request_topic: "/inspection/face/request"
+  face_result_topic: "/inspection/face/result"
+  face_debug_topic: "/inspection/face/debug"
+  capture_request_topic: "/inspection/capture/request"
+  capture_result_topic: "/inspection/capture/result"
+  status_topic: "/inspection/status"
+  cloud_topic: "/cloud_registered"
+  home_mode: "capture_on_trigger"
+  approach_distance_min: 2.0
+  approach_distance_max: 4.0
+  approach_distance_step: 0.2
+  safe_radius: 0.6
+  flight_height_min: 0.5
+  flight_height_max: 9.5
+  change_region_thickness: 1.0
+  fail_retry_count: 1
+  face_result_timeout_sec: 15.0
+  capture_result_timeout_sec: 10.0
+  # The mission may issue the face/capture request only after the target yaw
+  # has settled; 0.15 rad is approximately 8.6 degrees.
+  arrival_yaw_tolerance_rad: 0.15
+  face:
+    forward_min: 1.0
+    # cave1's selected face is about 3.4 m in front of the anchor.  A short
+    # ROI rejects deeper, unrelated surfaces in the tunnel.
+    forward_max: 5.0
+    min_confidence: 0.75
+    min_area: 4.0
+    min_points: 300
+    normal_alignment_min: 0.8
+    voxel_leaf: 0.1
+    cluster_tolerance: 0.35
+    cluster_min_size: 200
+    ransac_dist: 0.08
+    stability_frames: 3
+    stability_center_tol: 0.35
+    stability_normal_tol: 0.15
+    # These gates are used only after a successful face has been persisted as
+    # face_prior_valid.  The current manual anchor explicitly has no prior.
+    prior_center_tolerance: 3.0
+    prior_normal_alignment_min: 0.9
+  coverage:
+    camera_hfov_deg: 70.0
+    camera_vfov_deg: 50.0
+    capture_distance: 4.0
+    image_overlap: 0.7
+    min_observation_count: 2
+    min_baseline_angle_deg: 8.0
+    max_incidence_angle_deg: 60.0
+    surface_sample_resolution: 0.4
+    # MaRSIM's instantaneous LiDAR map is incomplete behind the current
+    # sensor ray. Unknown cells cannot invalidate image visibility; occupied
+    # cells still do, and flight poses use the inflated collision map.
+    visibility_unknown_as_occupied: false
+    min_predicted_coverage: 0.95
+    # cave1's ~12 x 8 m face needs more than the old implicit 24-view cap
+    # when every sample must be observed twice.
+    max_viewpoints: 60
+    # Capture only after the vehicle reaches a settled hover.  The next
+    # state2state leg is submitted after this dwell and capture acknowledgement.
+    capture_settle_time_sec: 0.5

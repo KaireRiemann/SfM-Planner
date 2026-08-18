@@ -65,6 +65,37 @@ namespace general_planner::checker {
             return CheckResult::Fatal("CONFIG_BAD_STATE2STATE_NEAR_GOAL_RADIUS",
                                       "state2state near_goal_radius must be positive");
         }
+        if (cfg.state2state_topology_query_capability_enable &&
+            !cfg.state2state_topology_enable) {
+            return CheckResult::Fatal("CONFIG_TOPOLOGY_QUERY_WITHOUT_TOPOLOGY",
+                                      "topology query capability requires topology/enable=true");
+        }
+        if (cfg.state2state_topology_query_capability_enable &&
+            cfg.state2state_topology_selection_topic.empty()) {
+            return CheckResult::Fatal("CONFIG_TOPOLOGY_SELECTION_TOPIC_EMPTY",
+                                      "topology selection_topic must not be empty");
+        }
+        if (!std::isfinite(cfg.state2state_topology_min_query_distance) ||
+            cfg.state2state_topology_min_query_distance < 0.0 ||
+            !std::isfinite(cfg.state2state_topology_local_prefix_length) ||
+            cfg.state2state_topology_local_prefix_length < 0.0 ||
+            !std::isfinite(cfg.state2state_topology_local_boundary_margin) ||
+            cfg.state2state_topology_local_boundary_margin < 0.0 ||
+            !std::isfinite(cfg.state2state_topology_route_deviation_requery_distance) ||
+            cfg.state2state_topology_route_deviation_requery_distance < 0.0 ||
+            !std::isfinite(cfg.state2state_topology_route_query_min_interval) ||
+            cfg.state2state_topology_route_query_min_interval < 0.0 ||
+            cfg.state2state_topology_route_rejoin_max_candidates < 1 ||
+            !std::isfinite(cfg.state2state_topology_breadcrumb_spacing) ||
+            cfg.state2state_topology_breadcrumb_spacing <= 0.0 ||
+            !std::isfinite(cfg.state2state_topology_breadcrumb_max_segment) ||
+            cfg.state2state_topology_breadcrumb_max_segment <= 0.0 ||
+            !std::isfinite(cfg.state2state_topology_breadcrumb_attach_radius) ||
+            cfg.state2state_topology_breadcrumb_attach_radius <= 0.0 ||
+            cfg.state2state_topology_breadcrumb_max_points < 2) {
+            return CheckResult::Fatal("CONFIG_BAD_TOPOLOGY_ROUTE_POLICY",
+                                      "topology route policy thresholds are invalid");
+        }
         return CheckResult::Ok();
     }
 

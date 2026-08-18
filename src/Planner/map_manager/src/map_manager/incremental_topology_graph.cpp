@@ -20,6 +20,26 @@ bool samePosition(const rog_map::Vec3f &lhs, const rog_map::Vec3f &rhs) {
 
 } // namespace
 
+const char *IncrementalTopologyGraph::constructionModeName(
+    const ConstructionMode mode) {
+    switch (mode) {
+        case ConstructionMode::DENSE_KNOWN_FREE_DEBUG:
+            return "dense_known_free";
+        case ConstructionMode::PERSISTENT_BUBBLE_SKELETON:
+        default:
+            return "persistent_bubble_skeleton";
+    }
+}
+
+IncrementalTopologyGraph::ConstructionMode
+IncrementalTopologyGraph::constructionModeFromString(const std::string &name) {
+    if (name == "dense_known_free" || name == "dense_known_free_debug") {
+        return ConstructionMode::DENSE_KNOWN_FREE_DEBUG;
+    }
+    // Keep the old parameter value as a compatible alias.
+    return ConstructionMode::PERSISTENT_BUBBLE_SKELETON;
+}
+
 std::size_t IncrementalTopologyGraph::RegionKeyHash::operator()(
     const RegionKey &key) const {
     std::size_t seed = std::hash<int>{}(key.x);
@@ -31,23 +51,20 @@ std::size_t IncrementalTopologyGraph::RegionKeyHash::operator()(
 IncrementalTopologyGraph::Config IncrementalTopologyGraph::sanitized(
     const Config &input) {
     Config cfg = input;
-    if (cfg.dense_known_free) {
-        // A persistent graph must never turn absence of observation into
-        // durable free-space evidence.
-        cfg.unknown_as_free = false;
-    }
+    // Neither persistent skeletons nor diagnostic dense roadmaps may turn
+    // absence of observation into durable free-space evidence.
+    cfg.unknown_as_free = false;
     cfg.region_size = std::max(0.2, cfg.region_size);
     if (!std::isfinite(cfg.navigation_altitude)) {
         cfg.navigation_altitude = 0.0;
     }
     cfg.sample_spacing = clampValue(cfg.sample_spacing, 0.05, cfg.region_size);
-    cfg.dense_evidence_vertical_tolerance =
-        std::max(0.0, cfg.dense_evidence_vertical_tolerance);
     cfg.min_clearance = std::max(0.0, cfg.min_clearance);
     cfg.max_clearance = std::max(cfg.min_clearance, cfg.max_clearance);
     cfg.candidate_separation = std::max(cfg.sample_spacing, cfg.candidate_separation);
     cfg.stable_match_distance = std::max(0.0, cfg.stable_match_distance);
-    cfg.connection_radius = std::max(cfg.candidate_separation, cfg.connection_radius);
+    cfg.connection_radius =
+        std::max(cfg.candidate_separation, cfg.connection_radius);
     cfg.edge_sample_spacing = std::max(0.02, cfg.edge_sample_spacing);
     cfg.dirty_padding = std::max(0.0, cfg.dirty_padding);
     cfg.bubble_overlap_margin = std::max(0.0, cfg.bubble_overlap_margin);
@@ -83,21 +100,20 @@ void IncrementalTopologyGraph::configure(const Config &config) {
         config_ = sanitized_config;
         nodes_.clear();
         regions_.clear();
+        initialized_regions_.clear();
+        dense_node_index_.clear();
         next_node_id_ = 1;
         revision_ = 0;
         rebuilt_region_count_ = 0;
         empty_region_count_ = 0;
         last_candidate_diagnostics_ = CandidateDiagnostics{};
     }
-    {
-        std::unique_lock<std::shared_mutex> evidence_lock(
-            dense_evidence_mutex_);
-        dense_evidence_.clear();
-    }
     publishSearchSnapshot();
     {
         std::lock_guard<std::mutex> dirty_lock(dirty_mutex_);
         dirty_regions_.clear();
+        dirty_dense_cells_.clear();
+        dirty_evidence_seeds_.clear();
         observed_route_regions_.clear();
     }
     active_.store(sanitized_config.enabled, std::memory_order_release);
@@ -159,25 +175,35 @@ IncrementalTopologyGraph::RegionKey IncrementalTopologyGraph::denseCellOf(
                 : static_cast<int>(std::floor(position.z() / spacing))};
 }
 
-bool IncrementalTopologyGraph::denseEvidenceTraversable(
-    const rog_map::Vec3f &position) const {
-    if (!position.allFinite()) {
-        return false;
-    }
-    const RegionKey cell = denseCellOf(position);
-    std::shared_lock<std::shared_mutex> lock(dense_evidence_mutex_);
-    const auto found = dense_evidence_.find(cell);
-    return found != dense_evidence_.end() &&
-           found->second.free_count > 0 &&
-           found->second.occupied_count == 0;
-}
-
 bool IncrementalTopologyGraph::constructionTraversable(
     const rog_map::Vec3f &position,
     const TopologyMapView &map_view) const {
-    return config_.dense_known_free
-        ? denseEvidenceTraversable(position)
-        : map_view.isTraversable(position);
+    return map_view.isTraversable(position);
+}
+
+bool IncrementalTopologyGraph::regionHasObservedFree(
+    const RegionKey &region, const TopologyMapView &map_view) const {
+    const rog_map::Vec3f minimum = regionMin(region);
+    const int z_samples = config_.planar_mode ? 1 : 3;
+    for (int ix = 0; ix < 3; ++ix) {
+        for (int iy = 0; iy < 3; ++iy) {
+            for (int iz = 0; iz < z_samples; ++iz) {
+                rog_map::Vec3f probe = minimum;
+                probe.x() += (static_cast<double>(ix) + 0.5) *
+                             config_.region_size / 3.0;
+                probe.y() += (static_cast<double>(iy) + 0.5) *
+                             config_.region_size / 3.0;
+                probe.z() = config_.planar_mode
+                    ? config_.navigation_altitude
+                    : minimum.z() + (static_cast<double>(iz) + 0.5) *
+                          config_.region_size / 3.0;
+                if (constructionTraversable(probe, map_view)) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 void IncrementalTopologyGraph::markDirty(const rog_map::Vec3f &position) {
@@ -250,147 +276,57 @@ void IncrementalTopologyGraph::markDirtyVoxels(
     }
     const int padding = static_cast<int>(std::ceil(cfg.dirty_padding / cfg.region_size));
     std::unordered_set<RegionKey, RegionKeyHash> changed_regions;
+    std::unordered_map<
+        RegionKey,
+        std::unordered_set<RegionKey, RegionKeyHash>,
+        RegionKeyHash> changed_cells;
+    std::unordered_map<RegionKey, rog_map::vec_Vec3f, RegionKeyHash>
+        evidence_seeds;
     changed_regions.reserve(indices.size());
+    changed_cells.reserve(indices.size());
     for (const rog_map::Vec3i &index : indices) {
         const rog_map::Vec3f position =
             (index.cast<double>() + rog_map::Vec3f::Constant(0.5)) * resolution;
-        changed_regions.insert({
+        const RegionKey region{
             static_cast<int>(std::floor(position.x() / cfg.region_size)),
             static_cast<int>(std::floor(position.y() / cfg.region_size)),
             cfg.planar_mode
                 ? 0
-                : static_cast<int>(std::floor(position.z() / cfg.region_size))});
+                : static_cast<int>(std::floor(position.z() / cfg.region_size))};
+        changed_regions.insert(region);
+        evidence_seeds[region].push_back(position);
+        if (cfg.construction_mode == ConstructionMode::DENSE_KNOWN_FREE_DEBUG) {
+            changed_cells[region].insert({
+                static_cast<int>(std::floor(position.x() / cfg.sample_spacing)),
+                static_cast<int>(std::floor(position.y() / cfg.sample_spacing)),
+                cfg.planar_mode
+                    ? 0
+                    : static_cast<int>(
+                          std::floor(position.z() / cfg.sample_spacing))});
+        }
     }
     const int z_padding = cfg.planar_mode ? 0 : padding;
     std::lock_guard<std::mutex> lock(dirty_mutex_);
+    for (auto &entry : changed_cells) {
+        auto &destination = dirty_dense_cells_[entry.first];
+        destination.insert(entry.second.begin(), entry.second.end());
+    }
+    const std::size_t max_seed_count =
+        std::max<std::size_t>(64, 8 * cfg.max_bubbles_per_region);
+    for (auto &entry : evidence_seeds) {
+        auto &destination = dirty_evidence_seeds_[entry.first];
+        const std::size_t remaining = destination.size() < max_seed_count
+            ? max_seed_count - destination.size() : 0;
+        const std::size_t count = std::min(remaining, entry.second.size());
+        destination.insert(destination.end(), entry.second.begin(),
+                           entry.second.begin() +
+                               static_cast<std::ptrdiff_t>(count));
+    }
     for (const RegionKey &center : changed_regions) {
         for (int x = -padding; x <= padding; ++x) {
             for (int y = -padding; y <= padding; ++y) {
                 for (int z = -z_padding; z <= z_padding; ++z) {
                     dirty_regions_.insert({center.x + x, center.y + y, center.z + z});
-                }
-            }
-        }
-    }
-}
-
-void IncrementalTopologyGraph::integrateDenseEvidence(
-    const std::vector<VoxelEvidenceDelta> &deltas,
-    const double resolution) {
-    if (deltas.empty() || !std::isfinite(resolution) ||
-        resolution <= 0.0) {
-        return;
-    }
-
-    Config cfg;
-    {
-        std::shared_lock<std::shared_mutex> lock(graph_mutex_);
-        cfg = config_;
-    }
-    if (!cfg.enabled || !cfg.dense_known_free) {
-        return;
-    }
-
-    std::unordered_map<RegionKey, DenseEvidence, RegionKeyHash> batch;
-    batch.reserve(deltas.size());
-    for (const VoxelEvidenceDelta &delta : deltas) {
-        if (delta.free_delta == 0 && delta.occupied_delta == 0) {
-            continue;
-        }
-        const rog_map::Vec3f position =
-            (delta.index.cast<double>() +
-             rog_map::Vec3f::Constant(0.5)) * resolution;
-        if (cfg.planar_mode &&
-            std::abs(position.z() - cfg.navigation_altitude) >
-                cfg.dense_evidence_vertical_tolerance + 1.0e-9) {
-            continue;
-        }
-        const RegionKey cell{
-            static_cast<int>(std::floor(
-                position.x() / cfg.sample_spacing)),
-            static_cast<int>(std::floor(
-                position.y() / cfg.sample_spacing)),
-            cfg.planar_mode
-                ? 0
-                : static_cast<int>(std::floor(
-                      position.z() / cfg.sample_spacing))};
-        DenseEvidence &sum = batch[cell];
-        sum.free_count += delta.free_delta;
-        sum.occupied_count += delta.occupied_delta;
-    }
-    if (batch.empty()) {
-        return;
-    }
-
-    std::vector<RegionKey> changed_cells;
-    changed_cells.reserve(batch.size());
-    {
-        std::unique_lock<std::shared_mutex> lock(dense_evidence_mutex_);
-        for (const auto &entry : batch) {
-            auto found = dense_evidence_.find(entry.first);
-            const bool was_traversable =
-                found != dense_evidence_.end() &&
-                found->second.free_count > 0 &&
-                found->second.occupied_count == 0;
-            if (found == dense_evidence_.end()) {
-                found = dense_evidence_
-                    .emplace(entry.first, DenseEvidence{})
-                    .first;
-            }
-            DenseEvidence &evidence = found->second;
-            evidence.free_count = std::max<std::int64_t>(
-                0, evidence.free_count + entry.second.free_count);
-            evidence.occupied_count = std::max<std::int64_t>(
-                0, evidence.occupied_count +
-                       entry.second.occupied_count);
-            const bool is_traversable =
-                evidence.free_count > 0 &&
-                evidence.occupied_count == 0;
-            if (was_traversable != is_traversable) {
-                changed_cells.push_back(entry.first);
-            }
-            if (evidence.free_count == 0 &&
-                evidence.occupied_count == 0) {
-                dense_evidence_.erase(found);
-            }
-        }
-    }
-    if (changed_cells.empty()) {
-        return;
-    }
-
-    const int padding = static_cast<int>(std::ceil(
-        cfg.dirty_padding / cfg.region_size));
-    const int z_padding = cfg.planar_mode ? 0 : padding;
-    std::unordered_set<RegionKey, RegionKeyHash> changed_regions;
-    changed_regions.reserve(changed_cells.size());
-    for (const RegionKey &cell : changed_cells) {
-        rog_map::Vec3f center(
-            (static_cast<double>(cell.x) + 0.5) *
-                cfg.sample_spacing,
-            (static_cast<double>(cell.y) + 0.5) *
-                cfg.sample_spacing,
-            cfg.planar_mode
-                ? cfg.navigation_altitude
-                : (static_cast<double>(cell.z) + 0.5) *
-                      cfg.sample_spacing);
-        changed_regions.insert({
-            static_cast<int>(std::floor(
-                center.x() / cfg.region_size)),
-            static_cast<int>(std::floor(
-                center.y() / cfg.region_size)),
-            cfg.planar_mode
-                ? 0
-                : static_cast<int>(std::floor(
-                      center.z() / cfg.region_size))});
-    }
-    std::lock_guard<std::mutex> dirty_lock(dirty_mutex_);
-    for (const RegionKey &center : changed_regions) {
-        for (int x = -padding; x <= padding; ++x) {
-            for (int y = -padding; y <= padding; ++y) {
-                for (int z = -z_padding; z <= z_padding; ++z) {
-                    dirty_regions_.insert(
-                        {center.x + x, center.y + y, center.z + z});
                 }
             }
         }
@@ -410,7 +346,7 @@ void IncrementalTopologyGraph::observePlannedPath(
             return;
         }
     }
-    if (cfg.dense_known_free) {
+    if (cfg.construction_mode == ConstructionMode::DENSE_KNOWN_FREE_DEBUG) {
         // A planned path is not sensor evidence. Dense persistent construction
         // is driven exclusively by the initial observed window and discrete
         // occupancy-state changes.
@@ -453,13 +389,106 @@ void IncrementalTopologyGraph::observePlannedPath(
     }
 }
 
+void IncrementalTopologyGraph::observeVerifiedPath(
+    const rog_map::vec_Vec3f &path) {
+    if (!active() || path.empty()) {
+        return;
+    }
+    Config cfg;
+    {
+        std::shared_lock<std::shared_mutex> lock(graph_mutex_);
+        cfg = config_;
+        if (!cfg.enabled) {
+            return;
+        }
+    }
+
+    const auto routeRegion = [&cfg](const rog_map::Vec3f &position) {
+        return RegionKey{
+            static_cast<int>(std::floor(position.x() / cfg.region_size)),
+            static_cast<int>(std::floor(position.y() / cfg.region_size)),
+            cfg.planar_mode
+                ? 0
+                : static_cast<int>(std::floor(position.z() / cfg.region_size))};
+    };
+    const int padding = static_cast<int>(std::ceil(
+        cfg.dirty_padding / cfg.region_size));
+    const int z_padding = cfg.planar_mode ? 0 : padding;
+    const double sample_step = std::max(
+        0.10, std::min(cfg.sample_spacing, 0.5 * cfg.region_size));
+    const std::size_t max_seed_count = std::max<std::size_t>(
+        64, 8 * cfg.max_bubbles_per_region);
+
+    std::unordered_map<RegionKey, rog_map::vec_Vec3f, RegionKeyHash> seeds;
+    const auto appendSeed = [&](const rog_map::Vec3f &position) {
+        if (!position.allFinite()) {
+            return;
+        }
+        auto &region_seeds = seeds[routeRegion(position)];
+        if (region_seeds.size() >= max_seed_count) {
+            return;
+        }
+        if (!region_seeds.empty() &&
+            (position - region_seeds.back()).norm() < 0.25 * sample_step) {
+            return;
+        }
+        region_seeds.push_back(position);
+    };
+
+    appendSeed(path.front());
+    for (std::size_t i = 1; i < path.size(); ++i) {
+        if (!path[i - 1].allFinite() || !path[i].allFinite()) {
+            continue;
+        }
+        const rog_map::Vec3f delta = path[i] - path[i - 1];
+        const int samples = std::max(1, static_cast<int>(std::ceil(
+            delta.norm() / sample_step)));
+        for (int sample = 1; sample <= samples; ++sample) {
+            appendSeed(path[i - 1] +
+                       (static_cast<double>(sample) / samples) * delta);
+        }
+    }
+    if (seeds.empty()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(dirty_mutex_);
+    for (auto &entry : seeds) {
+        const RegionKey &region = entry.first;
+        auto &destination = dirty_evidence_seeds_[region];
+        const std::size_t remaining = destination.size() < max_seed_count
+            ? max_seed_count - destination.size() : 0;
+        const std::size_t count = std::min(remaining, entry.second.size());
+        destination.insert(destination.end(), entry.second.begin(),
+                           entry.second.begin() +
+                               static_cast<std::ptrdiff_t>(count));
+        for (int x = -padding; x <= padding; ++x) {
+            for (int y = -padding; y <= padding; ++y) {
+                for (int z = -z_padding; z <= z_padding; ++z) {
+                    dirty_regions_.insert(
+                        {region.x + x, region.y + y, region.z + z});
+                }
+            }
+        }
+    }
+}
+
 bool IncrementalTopologyGraph::lineTraversable(const rog_map::Vec3f &start,
                                                 const rog_map::Vec3f &goal,
                                                 const TopologyMapView &map_view,
-                                                double sample_spacing,
-                                                const bool use_dense_evidence) const {
+                                                double sample_spacing) const {
+    return lineEvidence(start, goal, map_view, sample_spacing) ==
+           TopologyMapView::EvidenceState::KNOWN_FREE;
+}
+
+TopologyMapView::EvidenceState IncrementalTopologyGraph::lineEvidence(
+    const rog_map::Vec3f &start,
+    const rog_map::Vec3f &goal,
+    const TopologyMapView &map_view,
+    double sample_spacing) const {
+    using EvidenceState = TopologyMapView::EvidenceState;
     if (!start.allFinite() || !goal.allFinite()) {
-        return false;
+        return EvidenceState::OCCUPIED;
     }
     const double distance = (goal - start).norm();
     if (!std::isfinite(sample_spacing) || sample_spacing <= 0.0) {
@@ -468,17 +497,20 @@ bool IncrementalTopologyGraph::lineTraversable(const rog_map::Vec3f &start,
     }
     const int steps = std::max(1, static_cast<int>(std::ceil(
         distance / sample_spacing)));
+    EvidenceState result = EvidenceState::KNOWN_FREE;
     for (int i = 0; i <= steps; ++i) {
         const double ratio = static_cast<double>(i) / static_cast<double>(steps);
         const rog_map::Vec3f sample =
             start + ratio * (goal - start);
-        if (use_dense_evidence
-                ? !denseEvidenceTraversable(sample)
-                : !map_view.isTraversable(sample)) {
-            return false;
+        const EvidenceState state = map_view.evidenceState(sample);
+        if (state == EvidenceState::OCCUPIED) {
+            return EvidenceState::OCCUPIED;
+        }
+        if (state == EvidenceState::UNKNOWN) {
+            result = EvidenceState::UNKNOWN;
         }
     }
-    return true;
+    return result;
 }
 
 double IncrementalTopologyGraph::estimateClearance(
@@ -488,7 +520,8 @@ double IncrementalTopologyGraph::estimateClearance(
     // planar state2state mode those bounds have already selected the flight
     // layer, so using the ESDF minimum again would reject every horizontal
     // bubble in a narrow altitude band.
-    if (!config_.dense_known_free && !config_.planar_mode &&
+    if (config_.construction_mode != ConstructionMode::DENSE_KNOWN_FREE_DEBUG &&
+        !config_.planar_mode &&
         map_view.getClearance(position, clearance) &&
         std::isfinite(clearance)) {
         return clampValue(clearance, 0.0, config_.max_clearance);
@@ -535,11 +568,13 @@ std::vector<IncrementalTopologyGraph::Node,
             Eigen::aligned_allocator<IncrementalTopologyGraph::Node>>
 IncrementalTopologyGraph::generateCandidates(const RegionKey &region,
                                               const TopologyMapView &map_view,
-                                              CandidateDiagnostics &diagnostics) const {
+                                              CandidateDiagnostics &diagnostics,
+                                              const rog_map::vec_Vec3f &evidence_seeds,
+                                              const bool evidence_only) const {
     std::vector<Node, Eigen::aligned_allocator<Node>> candidates;
     const rog_map::Vec3f minimum = regionMin(region);
 
-    if (config_.dense_known_free) {
+    if (config_.construction_mode == ConstructionMode::DENSE_KNOWN_FREE_DEBUG) {
         // Align samples to one global lattice rather than to each rebuilt
         // region. This makes node positions deterministic across incremental
         // updates and across negative/positive region boundaries.
@@ -577,20 +612,16 @@ IncrementalTopologyGraph::generateCandidates(const RegionKey &region,
                         continue;
                     }
                     ++diagnostics.traversable_center_count;
-                    const double clearance =
-                        estimateClearance(position, map_view);
-                    if (clearance + 1.0e-9 < config_.min_clearance) {
-                        ++diagnostics.clearance_rejected_count;
-                        continue;
-                    }
+                    // Dense coverage is driven by known-free evidence only.
+                    // Clearance / max_nodes_per_region must not punch holes.
                     Node node;
                     node.position = position;
-                    node.clearance = clearance;
+                    // Dense roadmap nodes are occupancy samples, not ESDF
+                    // bubbles. Their clearance is neither used for retention
+                    // nor for edge cost, so a 26-direction clearance sweep here
+                    // only multiplies ROG queries without changing the graph.
+                    node.clearance = 0.0;
                     candidates.push_back(node);
-                    if (candidates.size() >=
-                        config_.max_nodes_per_region) {
-                        return candidates;
-                    }
                 }
             }
         }
@@ -618,7 +649,53 @@ IncrementalTopologyGraph::generateCandidates(const RegionKey &region,
     std::vector<Bubble, Eigen::aligned_allocator<Bubble>> bubbles;
     bubbles.reserve(config_.max_bubbles_per_region);
 
-    while (!pending.empty() && bubbles.size() < config_.max_bubbles_per_region) {
+    if (config_.construction_mode ==
+        ConstructionMode::PERSISTENT_BUBBLE_SKELETON) {
+        const double seed_separation = std::max(
+            config_.edge_sample_spacing, 0.40 * config_.sample_spacing);
+        for (const rog_map::Vec3f &seed : evidence_seeds) {
+            if (bubbles.size() >= config_.max_bubbles_per_region) {
+                break;
+            }
+            ++diagnostics.sampled_center_count;
+            if (!constructionTraversable(seed, map_view)) {
+                continue;
+            }
+            ++diagnostics.traversable_center_count;
+            bool duplicate = false;
+            for (const Bubble &bubble : bubbles) {
+                if ((bubble.center - seed).norm() < seed_separation) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                continue;
+            }
+            const double clearance = estimateClearance(seed, map_view);
+            if (clearance + 1.0e-9 < config_.min_clearance) {
+                ++diagnostics.clearance_rejected_count;
+                continue;
+            }
+            bubbles.push_back({seed, clearance});
+        }
+    }
+
+    bool run_octree = !evidence_only;
+    if (run_octree &&
+        config_.construction_mode == ConstructionMode::PERSISTENT_BUBBLE_SKELETON) {
+        // Forest click demos fill a 4 m cube with free space, so an octree
+        // finds bubbles. A tunnel corridor is a thin KNOWN_FREE band: voxel
+        // seeds already lie on that band, while the cube center is usually
+        // rock or unknown. Skip the octree whenever LiDAR already provided
+        // seeds, or when a coarse probe sees no free space at all.
+        if (!evidence_seeds.empty() || !regionHasObservedFree(region, map_view)) {
+            run_octree = false;
+        }
+    }
+
+    while (run_octree && !pending.empty() &&
+           bubbles.size() < config_.max_bubbles_per_region) {
         const Box box = pending.back();
         pending.pop_back();
         const rog_map::Vec3f center = 0.5 * (box.minimum + box.maximum);
@@ -626,9 +703,46 @@ IncrementalTopologyGraph::generateCandidates(const RegionKey &region,
         const double half_diagonal = half_size.norm();
         ++diagnostics.sampled_center_count;
 
+        rog_map::Vec3f candidate_center = center;
+        bool candidate_free = constructionTraversable(candidate_center, map_view);
+        const bool leaf_box = (box.maximum - box.minimum).maxCoeff() <=
+                              config_.sample_spacing + 1.0e-9;
+        if (!candidate_free && leaf_box && !config_.planar_mode) {
+            // Sensor rays may leave a thin KNOWN_FREE band which does not
+            // contain the mathematical octree center. Probe a small,
+            // deterministic stencil inside the leaf and snap only to a point
+            // explicitly classified KNOWN_FREE. UNKNOWN is never promoted.
+            std::vector<rog_map::Vec3f,
+                        Eigen::aligned_allocator<rog_map::Vec3f>> probes;
+            probes.reserve(7);
+            if (config_.navigation_altitude > box.minimum.z() &&
+                config_.navigation_altitude < box.maximum.z()) {
+                rog_map::Vec3f altitude_probe = center;
+                altitude_probe.z() = config_.navigation_altitude;
+                probes.push_back(altitude_probe);
+            }
+            for (int axis = 0; axis < 3; ++axis) {
+                for (int sign : {-1, 1}) {
+                    rog_map::Vec3f probe = center;
+                    probe[axis] += static_cast<double>(sign) *
+                                   0.90 * half_size[axis];
+                    probes.push_back(probe);
+                }
+            }
+            for (const rog_map::Vec3f &probe : probes) {
+                ++diagnostics.sampled_center_count;
+                if (constructionTraversable(probe, map_view)) {
+                    candidate_center = probe;
+                    candidate_free = true;
+                    break;
+                }
+            }
+        }
+
         bool covered = false;
         for (const Bubble &bubble : bubbles) {
-            if ((center - bubble.center).norm() + half_diagonal <= bubble.radius) {
+            if ((candidate_center - bubble.center).norm() + half_diagonal <=
+                bubble.radius) {
                 covered = true;
                 break;
             }
@@ -637,11 +751,11 @@ IncrementalTopologyGraph::generateCandidates(const RegionKey &region,
             continue;
         }
 
-        if (constructionTraversable(center, map_view)) {
+        if (candidate_free) {
             ++diagnostics.traversable_center_count;
-            const double clearance = estimateClearance(center, map_view);
+            const double clearance = estimateClearance(candidate_center, map_view);
             if (clearance >= config_.min_clearance) {
-                bubbles.push_back({center, clearance});
+                bubbles.push_back({candidate_center, clearance});
                 if (clearance + 1.0e-9 >= half_diagonal) {
                     continue;
                 }
@@ -650,8 +764,7 @@ IncrementalTopologyGraph::generateCandidates(const RegionKey &region,
             }
         }
 
-        if ((box.maximum - box.minimum).maxCoeff() <=
-            config_.sample_spacing + 1.0e-9) {
+        if (leaf_box) {
             continue;
         }
         const rog_map::Vec3f midpoint = center;
@@ -703,29 +816,97 @@ IncrementalTopologyGraph::generateCandidates(const RegionKey &region,
         }
     }
 
-    std::unordered_map<std::size_t, std::size_t> representative;
+    // Index by union root rather than iterating an unordered container. The
+    // deterministic order prevents a capped region from selecting a different
+    // set of components on equivalent rebuilds.
+    std::vector<std::vector<std::size_t>> components(bubbles.size());
+    for (std::size_t i = 0; i < bubbles.size(); ++i) {
+        components[root(i)].push_back(i);
+    }
+
     const rog_map::Vec3f region_center =
         minimum + rog_map::Vec3f::Constant(0.5 * config_.region_size);
-    for (std::size_t i = 0; i < bubbles.size(); ++i) {
-        const std::size_t component = root(i);
-        const auto found = representative.find(component);
-        if (found == representative.end()) {
-            representative.emplace(component, i);
+    std::vector<std::size_t> selected;
+    selected.reserve(config_.max_nodes_per_region);
+    const auto appendSelected = [&](const std::size_t index) {
+        if (selected.size() >= config_.max_nodes_per_region ||
+            std::find(selected.begin(), selected.end(), index) != selected.end()) {
+            return;
+        }
+        selected.push_back(index);
+    };
+
+    for (const auto &members : components) {
+        if (selected.size() >= config_.max_nodes_per_region) {
+            break;
+        }
+        if (members.empty()) {
             continue;
         }
-        const Bubble &current = bubbles[found->second];
-        const double current_score = (current.center - region_center).norm() -
-                                     0.25 * current.radius;
-        const double candidate_score = (bubbles[i].center - region_center).norm() -
-                                       0.25 * bubbles[i].radius;
-        if (candidate_score < current_score) {
-            found->second = i;
+
+        // Keep a maximum-clearance core for the component. It represents open
+        // volume while portal nodes below preserve turns, doors and vertical
+        // connections which a single component representative would erase.
+        std::size_t core = members.front();
+        for (const std::size_t index : members) {
+            const Bubble &candidate = bubbles[index];
+            const Bubble &current = bubbles[core];
+            if (candidate.radius > current.radius + 1.0e-9 ||
+                (std::abs(candidate.radius - current.radius) <= 1.0e-9 &&
+                 (candidate.center - region_center).squaredNorm() <
+                     (current.center - region_center).squaredNorm())) {
+                core = index;
+            }
+        }
+        appendSelected(core);
+
+        const int axes = config_.planar_mode ? 2 : 3;
+        for (int axis = 0; axis < axes; ++axis) {
+            for (int side = 0; side < 2; ++side) {
+                std::size_t portal = members.front();
+                double best_face_gap = std::numeric_limits<double>::infinity();
+                bool reaches_face = false;
+                for (const std::size_t index : members) {
+                    const Bubble &bubble = bubbles[index];
+                    const double face = side == 0
+                        ? minimum[axis]
+                        : minimum[axis] + config_.region_size;
+                    const double center_gap = std::abs(bubble.center[axis] - face);
+                    const double surface_gap = std::max(0.0, center_gap - bubble.radius);
+                    const bool reaches = surface_gap <= config_.sample_spacing + 1.0e-9;
+                    if ((reaches && !reaches_face) ||
+                        (reaches == reaches_face &&
+                         surface_gap < best_face_gap - 1.0e-9) ||
+                        (reaches == reaches_face &&
+                         std::abs(surface_gap - best_face_gap) <= 1.0e-9 &&
+                         bubble.radius > bubbles[portal].radius)) {
+                        portal = index;
+                        best_face_gap = surface_gap;
+                        reaches_face = reaches;
+                    }
+                }
+                if (reaches_face) {
+                    bool separated = true;
+                    for (const std::size_t index : selected) {
+                        if ((bubbles[index].center - bubbles[portal].center).norm() <
+                            0.5 * config_.candidate_separation) {
+                            separated = false;
+                            break;
+                        }
+                    }
+                    if (separated) {
+                        appendSelected(portal);
+                    }
+                }
+            }
         }
     }
-    for (const auto &entry : representative) {
+
+    for (const std::size_t index : selected) {
         Node node;
-        node.position = bubbles[entry.second].center;
-        node.clearance = bubbles[entry.second].radius;
+        node.position = bubbles[index].center;
+        node.clearance = bubbles[index].radius;
+        node.state = NodeState::ACTIVE;
         candidates.push_back(node);
     }
 
@@ -744,9 +925,14 @@ IncrementalTopologyGraph::generateCandidates(const RegionKey &region,
     return candidates;
 }
 
-bool IncrementalTopologyGraph::popDirtyRegion(RegionKey &region,
-                                               const rog_map::Vec3f *focus) {
+bool IncrementalTopologyGraph::popDirtyRegion(
+    RegionKey &region,
+    std::vector<RegionKey> &changed_dense_cells,
+    rog_map::vec_Vec3f &evidence_seeds,
+    const rog_map::Vec3f *focus) {
     std::lock_guard<std::mutex> lock(dirty_mutex_);
+    changed_dense_cells.clear();
+    evidence_seeds.clear();
     if (dirty_regions_.empty()) {
         return false;
     }
@@ -771,14 +957,29 @@ bool IncrementalTopologyGraph::popDirtyRegion(RegionKey &region,
     }
     region = *iterator;
     dirty_regions_.erase(iterator);
+    const auto changed = dirty_dense_cells_.find(region);
+    if (changed != dirty_dense_cells_.end()) {
+        changed_dense_cells.assign(changed->second.begin(),
+                                   changed->second.end());
+        dirty_dense_cells_.erase(changed);
+    }
+    const auto seeds = dirty_evidence_seeds_.find(region);
+    if (seeds != dirty_evidence_seeds_.end()) {
+        evidence_seeds = std::move(seeds->second);
+        dirty_evidence_seeds_.erase(seeds);
+    }
     return true;
 }
 
-void IncrementalTopologyGraph::rebuildRegion(const RegionKey &region,
-                                             const TopologyMapView &map_view) {
+void IncrementalTopologyGraph::rebuildRegion(
+    const RegionKey &region,
+    const std::vector<RegionKey> &changed_dense_cells,
+    const rog_map::vec_Vec3f &evidence_seeds,
+    const TopologyMapView &map_view) {
     CandidateDiagnostics diagnostics;
-    auto candidates = generateCandidates(region, map_view, diagnostics);
     std::vector<Node, Eigen::aligned_allocator<Node>> old_nodes;
+    std::vector<rog_map::Vec3f,
+                Eigen::aligned_allocator<rog_map::Vec3f>> nearby_external_nodes;
     {
         std::shared_lock<std::shared_mutex> lock(graph_mutex_);
         const auto region_it = regions_.find(region);
@@ -791,25 +992,126 @@ void IncrementalTopologyGraph::rebuildRegion(const RegionKey &region,
                 }
             }
         }
+        if (config_.construction_mode ==
+            ConstructionMode::PERSISTENT_BUBBLE_SKELETON) {
+            const int reach = static_cast<int>(std::ceil(
+                config_.candidate_separation / config_.region_size)) + 1;
+            const int z_reach = config_.planar_mode ? 0 : reach;
+            for (int dx = -reach; dx <= reach; ++dx) {
+                for (int dy = -reach; dy <= reach; ++dy) {
+                    for (int dz = -z_reach; dz <= z_reach; ++dz) {
+                        const RegionKey neighbor_region{
+                            region.x + dx, region.y + dy, region.z + dz};
+                        if (neighbor_region == region) {
+                            continue;
+                        }
+                        const auto neighbor_it = regions_.find(neighbor_region);
+                        if (neighbor_it == regions_.end()) {
+                            continue;
+                        }
+                        for (const NodeId id : neighbor_it->second) {
+                            const auto node_it = nodes_.find(id);
+                            if (node_it != nodes_.end()) {
+                                nearby_external_nodes.push_back(
+                                    node_it->second.node.position);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
+    auto candidates = generateCandidates(
+        region, map_view, diagnostics, evidence_seeds,
+        config_.construction_mode ==
+                ConstructionMode::PERSISTENT_BUBBLE_SKELETON &&
+            !evidence_seeds.empty());
 
     std::unordered_set<NodeId> matched;
-    for (Node &candidate : candidates) {
-        double best_distance = config_.stable_match_distance;
-        NodeId best_id = 0;
+    if (config_.construction_mode ==
+        ConstructionMode::PERSISTENT_BUBBLE_SKELETON) {
+        // Committed topology is append-only for the lifetime of the task.
+        // Re-observation may refresh state, but it must not move or replace an
+        // existing node. Only an explicit OCCUPIED observation invalidates it.
+        std::vector<Node, Eigen::aligned_allocator<Node>> committed;
+        committed.reserve(old_nodes.size() + candidates.size());
+        for (const Node &old_node : old_nodes) {
+            const TopologyMapView::EvidenceState state =
+                map_view.evidenceState(old_node.position);
+            if (state == TopologyMapView::EvidenceState::OCCUPIED) {
+                continue;
+            }
+            Node retained = old_node;
+            retained.state = state == TopologyMapView::EvidenceState::KNOWN_FREE
+                ? NodeState::ACTIVE : NodeState::HISTORICAL;
+            committed.push_back(retained);
+            matched.insert(retained.id);
+        }
+
+        const auto tooCloseToCommitted = [&](const rog_map::Vec3f &position) {
+            for (const Node &node : committed) {
+                if ((node.position - position).norm() + 1.0e-9 <
+                    config_.candidate_separation) {
+                    return true;
+                }
+            }
+            for (const rog_map::Vec3f &external : nearby_external_nodes) {
+                if ((external - position).norm() + 1.0e-9 <
+                    config_.candidate_separation) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        for (Node &candidate : candidates) {
+            if (committed.size() >= config_.max_nodes_per_region) {
+                break;
+            }
+            if (tooCloseToCommitted(candidate.position)) {
+                continue;
+            }
+            candidate.state = NodeState::ACTIVE;
+            committed.push_back(candidate);
+        }
+        candidates = std::move(committed);
+    } else {
+        for (Node &candidate : candidates) {
+            double best_distance = config_.stable_match_distance;
+            NodeId best_id = 0;
+            for (const Node &old_node : old_nodes) {
+                if (matched.count(old_node.id) != 0U) {
+                    continue;
+                }
+                if (!(denseCellOf(candidate.position) ==
+                      denseCellOf(old_node.position))) {
+                    continue;
+                }
+                const double distance =
+                    (candidate.position - old_node.position).norm();
+                if (distance <= best_distance) {
+                    best_distance = distance;
+                    best_id = old_node.id;
+                }
+            }
+            if (best_id != 0) {
+                candidate.id = best_id;
+                matched.insert(best_id);
+            }
+        }
+
+        // Dense debug mode retains committed samples when the rolling map can
+        // no longer classify them, but removes samples confirmed occupied.
         for (const Node &old_node : old_nodes) {
             if (matched.count(old_node.id) != 0U) {
                 continue;
             }
-            const double distance = (candidate.position - old_node.position).norm();
-            if (distance <= best_distance) {
-                best_distance = distance;
-                best_id = old_node.id;
+            if (map_view.evidenceState(old_node.position) ==
+                TopologyMapView::EvidenceState::UNKNOWN) {
+                Node historical = old_node;
+                historical.state = NodeState::HISTORICAL;
+                candidates.push_back(historical);
+                matched.insert(old_node.id);
             }
-        }
-        if (best_id != 0) {
-            candidate.id = best_id;
-            matched.insert(best_id);
         }
     }
 
@@ -819,9 +1121,20 @@ void IncrementalTopologyGraph::rebuildRegion(const RegionKey &region,
         const auto old_region_it = regions_.find(region);
         if (old_region_it != regions_.end()) {
             for (const NodeId old_id : old_region_it->second) {
+                // Matched/committed nodes retain their ID and position. Exact
+                // state changes below decide whether incident edges need
+                // validation; only unmatched (confirmed occupied) nodes die.
+                if (matched.count(old_id) != 0U) {
+                    continue;
+                }
                 const auto old_node_it = nodes_.find(old_id);
                 if (old_node_it == nodes_.end()) {
                     continue;
+                }
+                if (config_.construction_mode ==
+                    ConstructionMode::DENSE_KNOWN_FREE_DEBUG) {
+                    dense_node_index_.erase(
+                        denseCellOf(old_node_it->second.node.position));
                 }
                 for (const auto &neighbor : old_node_it->second.neighbors) {
                     const auto neighbor_it = nodes_.find(neighbor.first);
@@ -831,10 +1144,10 @@ void IncrementalTopologyGraph::rebuildRegion(const RegionKey &region,
                 }
                 nodes_.erase(old_node_it);
             }
-            regions_.erase(old_region_it);
         }
 
         ++revision_;
+        initialized_regions_.insert(region);
         last_candidate_diagnostics_ = diagnostics;
         if (candidates.empty()) {
             ++empty_region_count_;
@@ -844,22 +1157,40 @@ void IncrementalTopologyGraph::rebuildRegion(const RegionKey &region,
                 candidate.id = next_node_id_++;
             }
             candidate.revision = revision_;
+            if (candidate.state == NodeState::ACTIVE) {
+                candidate.last_observed_revision = revision_;
+            }
+            const auto existing = nodes_.find(candidate.id);
+            if (existing != nodes_.end()) {
+                existing->second.node = candidate;
+                continue;
+            }
             NodeRecord record;
             record.node = candidate;
             record.region = region;
             nodes_.emplace(candidate.id, std::move(record));
+            if (config_.construction_mode ==
+                ConstructionMode::DENSE_KNOWN_FREE_DEBUG) {
+                dense_node_index_[denseCellOf(candidate.position)] = candidate.id;
+            }
             affected_ids.push_back(candidate.id);
         }
-        if (!affected_ids.empty()) {
-            regions_[region] = affected_ids;
+        if (!candidates.empty()) {
+            std::vector<NodeId> region_ids;
+            region_ids.reserve(candidates.size());
+            for (const Node &candidate : candidates) {
+                region_ids.push_back(candidate.id);
+            }
+            regions_[region] = std::move(region_ids);
+        } else {
+            regions_.erase(region);
         }
         ++rebuilt_region_count_;
     }
 
-    // A new obstacle can cut a long edge even when neither endpoint belongs to
-    // this region. Only endpoints within one connection radius can own such an
-    // edge, so use the region index instead of scanning the complete global
-    // graph.
+    // A new obstacle can cut an edge even when neither endpoint belongs to
+    // this region. Dense mode can find all possible owners by direct lattice
+    // lookup. The old region/edge scan remains for non-lattice bubble mode.
     const rog_map::Vec3f dirty_min = regionMin(region) -
         rog_map::Vec3f::Constant(config_.edge_sample_spacing);
     const rog_map::Vec3f dirty_max = regionMin(region) +
@@ -867,40 +1198,105 @@ void IncrementalTopologyGraph::rebuildRegion(const RegionKey &region,
     std::unordered_set<NodeId> affected_set(affected_ids.begin(), affected_ids.end());
     {
         std::shared_lock<std::shared_mutex> lock(graph_mutex_);
-        const int radius = static_cast<int>(std::ceil(
-            config_.connection_radius / config_.region_size)) + 1;
-        const int z_radius = config_.planar_mode ? 0 : radius;
-        for (int dx = -radius; dx <= radius; ++dx) {
-            for (int dy = -radius; dy <= radius; ++dy) {
-                for (int dz = -z_radius; dz <= z_radius; ++dz) {
-                    const auto region_it = regions_.find(
-                        {region.x + dx, region.y + dy, region.z + dz});
-                    if (region_it == regions_.end()) {
-                        continue;
+        if (config_.construction_mode ==
+                ConstructionMode::DENSE_KNOWN_FREE_DEBUG &&
+            !changed_dense_cells.empty()) {
+            // Only edges with an endpoint close to a genuinely changed ROG
+            // cell can have changed validity. This avoids rebuilding a whole
+            // 4 m region when most 1 m topology samples are unchanged.
+            const int reach = static_cast<int>(std::ceil(
+                config_.connection_radius / config_.sample_spacing));
+            const int z_reach = config_.planar_mode ? 0 : reach;
+            for (const RegionKey &cell : changed_dense_cells) {
+                for (int dx = -reach; dx <= reach; ++dx) {
+                    for (int dy = -reach; dy <= reach; ++dy) {
+                        for (int dz = -z_reach; dz <= z_reach; ++dz) {
+                            const auto found = dense_node_index_.find(
+                                {cell.x + dx, cell.y + dy, cell.z + dz});
+                            if (found != dense_node_index_.end()) {
+                                affected_set.insert(found->second);
+                            }
+                        }
                     }
-                    for (const NodeId id : region_it->second) {
-                        const auto entry = nodes_.find(id);
-                        if (entry == nodes_.end()) {
+                }
+            }
+        } else if (config_.construction_mode ==
+                       ConstructionMode::DENSE_KNOWN_FREE_DEBUG &&
+                   old_nodes.empty()) {
+            // First construction only needs the newly inserted sources;
+            // undirected insertion also updates already existing neighbors.
+        } else if (config_.construction_mode ==
+                   ConstructionMode::DENSE_KNOWN_FREE_DEBUG) {
+            const double spacing = config_.sample_spacing;
+            const rog_map::Vec3f minimum = regionMin(region);
+            const rog_map::Vec3f maximum =
+                minimum + rog_map::Vec3f::Constant(config_.region_size);
+            const auto firstIndex = [spacing](const double lower) {
+                return static_cast<int>(
+                    std::ceil(lower / spacing - 0.5 - 1.0e-9));
+            };
+            const auto lastIndex = [spacing](const double upper) {
+                return static_cast<int>(
+                    std::ceil(upper / spacing - 0.5 - 1.0e-9)) - 1;
+            };
+            // A lattice endpoint farther than this many cells cannot own an
+            // edge intersecting the rebuilt region.
+            const int reach = static_cast<int>(std::floor(
+                config_.connection_radius / spacing + 1.0e-9));
+            const int first_x = firstIndex(minimum.x()) - reach;
+            const int last_x = lastIndex(maximum.x()) + reach;
+            const int first_y = firstIndex(minimum.y()) - reach;
+            const int last_y = lastIndex(maximum.y()) + reach;
+            const int first_z = config_.planar_mode
+                ? 0 : firstIndex(minimum.z()) - reach;
+            const int last_z = config_.planar_mode
+                ? 0 : lastIndex(maximum.z()) + reach;
+            for (int x = first_x; x <= last_x; ++x) {
+                for (int y = first_y; y <= last_y; ++y) {
+                    for (int z = first_z; z <= last_z; ++z) {
+                        const auto found = dense_node_index_.find({x, y, z});
+                        if (found != dense_node_index_.end()) {
+                            affected_set.insert(found->second);
+                        }
+                    }
+                }
+            }
+        } else {
+            const int radius = static_cast<int>(std::ceil(
+                config_.connection_radius / config_.region_size)) + 1;
+            const int z_radius = config_.planar_mode ? 0 : radius;
+            for (int dx = -radius; dx <= radius; ++dx) {
+                for (int dy = -radius; dy <= radius; ++dy) {
+                    for (int dz = -z_radius; dz <= z_radius; ++dz) {
+                        const auto region_it = regions_.find(
+                            {region.x + dx, region.y + dy, region.z + dz});
+                        if (region_it == regions_.end()) {
                             continue;
                         }
-                        for (const auto &neighbor : entry->second.neighbors) {
-                            if (entry->first >= neighbor.first) {
+                        for (const NodeId id : region_it->second) {
+                            const auto entry = nodes_.find(id);
+                            if (entry == nodes_.end()) {
                                 continue;
                             }
-                            const auto neighbor_it = nodes_.find(neighbor.first);
-                            if (neighbor_it == nodes_.end()) {
-                                continue;
-                            }
-                            const rog_map::Vec3f segment_min =
-                                entry->second.node.position.cwiseMin(
-                                    neighbor_it->second.node.position);
-                            const rog_map::Vec3f segment_max =
-                                entry->second.node.position.cwiseMax(
-                                    neighbor_it->second.node.position);
-                            if ((segment_max.array() >= dirty_min.array()).all() &&
-                                (segment_min.array() <= dirty_max.array()).all()) {
-                                affected_set.insert(entry->first);
-                                affected_set.insert(neighbor.first);
+                            for (const auto &neighbor : entry->second.neighbors) {
+                                if (entry->first >= neighbor.first) {
+                                    continue;
+                                }
+                                const auto neighbor_it = nodes_.find(neighbor.first);
+                                if (neighbor_it == nodes_.end()) {
+                                    continue;
+                                }
+                                const rog_map::Vec3f segment_min =
+                                    entry->second.node.position.cwiseMin(
+                                        neighbor_it->second.node.position);
+                                const rog_map::Vec3f segment_max =
+                                    entry->second.node.position.cwiseMax(
+                                        neighbor_it->second.node.position);
+                                if ((segment_max.array() >= dirty_min.array()).all() &&
+                                    (segment_min.array() <= dirty_max.array()).all()) {
+                                    affected_set.insert(entry->first);
+                                    affected_set.insert(neighbor.first);
+                                }
                             }
                         }
                     }
@@ -920,6 +1316,8 @@ void IncrementalTopologyGraph::rebuildIncidentEdges(
         rog_map::Vec3f from_position{rog_map::Vec3f::Zero()};
         rog_map::Vec3f to_position{rog_map::Vec3f::Zero()};
         double distance{0.0};
+        bool existed{false};
+        bool crosses_region{false};
     };
 
     std::vector<CandidateEdge> candidate_edges;
@@ -931,20 +1329,27 @@ void IncrementalTopologyGraph::rebuildIncidentEdges(
                 continue;
             }
             std::vector<CandidateEdge> local;
-            const int radius = static_cast<int>(std::ceil(
-                config_.connection_radius / config_.region_size));
-            const int z_radius = config_.planar_mode ? 0 : radius;
-            const RegionKey source_region = source_it->second.region;
-            for (int dx = -radius; dx <= radius; ++dx) {
-                for (int dy = -radius; dy <= radius; ++dy) {
-                    for (int dz = -z_radius; dz <= z_radius; ++dz) {
-                        const auto region_it = regions_.find(
-                            {source_region.x + dx, source_region.y + dy,
-                             source_region.z + dz});
-                        if (region_it == regions_.end()) {
-                            continue;
-                        }
-                        for (const NodeId candidate_id : region_it->second) {
+            if (config_.construction_mode ==
+                ConstructionMode::DENSE_KNOWN_FREE_DEBUG) {
+                const RegionKey source_cell =
+                    denseCellOf(source_it->second.node.position);
+                const int radius = static_cast<int>(std::floor(
+                    config_.connection_radius / config_.sample_spacing +
+                    1.0e-9));
+                const int z_radius = config_.planar_mode ? 0 : radius;
+                for (int dx = -radius; dx <= radius; ++dx) {
+                    for (int dy = -radius; dy <= radius; ++dy) {
+                        for (int dz = -z_radius; dz <= z_radius; ++dz) {
+                            if (dx == 0 && dy == 0 && dz == 0) {
+                                continue;
+                            }
+                            const auto indexed = dense_node_index_.find(
+                                {source_cell.x + dx, source_cell.y + dy,
+                                 source_cell.z + dz});
+                            if (indexed == dense_node_index_.end()) {
+                                continue;
+                            }
+                            const NodeId candidate_id = indexed->second;
                             if (candidate_id == source_id) {
                                 continue;
                             }
@@ -960,18 +1365,54 @@ void IncrementalTopologyGraph::rebuildIncidentEdges(
                                     {source_id, candidate_id,
                                      source_it->second.node.position,
                                      candidate_it->second.node.position,
-                                     distance});
+                                     distance,
+                                     source_it->second.neighbors.count(
+                                         candidate_id) != 0U,
+                                     false});
                             }
                         }
                     }
                 }
-            }
-            std::sort(local.begin(), local.end(), [](const CandidateEdge &lhs,
-                                                     const CandidateEdge &rhs) {
-                return lhs.distance < rhs.distance;
-            });
-            if (local.size() > config_.max_neighbors) {
-                local.resize(config_.max_neighbors);
+            } else {
+                const int radius = static_cast<int>(std::ceil(
+                    config_.connection_radius / config_.region_size));
+                const int z_radius = config_.planar_mode ? 0 : radius;
+                const RegionKey source_region = source_it->second.region;
+                for (int dx = -radius; dx <= radius; ++dx) {
+                    for (int dy = -radius; dy <= radius; ++dy) {
+                        for (int dz = -z_radius; dz <= z_radius; ++dz) {
+                            const auto region_it = regions_.find(
+                                {source_region.x + dx, source_region.y + dy,
+                                 source_region.z + dz});
+                            if (region_it == regions_.end()) {
+                                continue;
+                            }
+                            for (const NodeId candidate_id : region_it->second) {
+                                if (candidate_id == source_id) {
+                                    continue;
+                                }
+                                const auto candidate_it = nodes_.find(candidate_id);
+                                if (candidate_it == nodes_.end()) {
+                                    continue;
+                                }
+                                const double distance =
+                                    (candidate_it->second.node.position -
+                                     source_it->second.node.position).norm();
+                                if (distance <= config_.connection_radius) {
+                                    local.push_back(
+                                        {source_id, candidate_id,
+                                         source_it->second.node.position,
+                                         candidate_it->second.node.position,
+                                         distance,
+                                         source_it->second.neighbors.count(
+                                             candidate_id) != 0U,
+                                         !(candidate_it->second.region ==
+                                           source_region)});
+                                }
+                            }
+                        }
+                    }
+                }
             }
             candidate_edges.insert(candidate_edges.end(), local.begin(), local.end());
         }
@@ -979,13 +1420,164 @@ void IncrementalTopologyGraph::rebuildIncidentEdges(
 
     std::vector<CandidateEdge> valid_edges;
     valid_edges.reserve(candidate_edges.size());
+    struct UndirectedEdgeKey {
+        NodeId low{0};
+        NodeId high{0};
+        bool operator==(const UndirectedEdgeKey &other) const {
+            return low == other.low && high == other.high;
+        }
+    };
+    struct UndirectedEdgeKeyHash {
+        std::size_t operator()(const UndirectedEdgeKey &key) const {
+            std::size_t seed = std::hash<NodeId>{}(key.low);
+            seed ^= std::hash<NodeId>{}(key.high) + 0x9e3779b9U +
+                    (seed << 6U) + (seed >> 2U);
+            return seed;
+        }
+    };
+    std::unordered_map<UndirectedEdgeKey,
+                       TopologyMapView::EvidenceState,
+                       UndirectedEdgeKeyHash>
+        validation_cache;
+    validation_cache.reserve(candidate_edges.size());
     for (const CandidateEdge &edge : candidate_edges) {
-        if (lineTraversable(edge.from_position, edge.to_position, map_view,
-                            0.0, config_.dense_known_free)) {
+        const UndirectedEdgeKey key{
+            std::min(edge.from, edge.to), std::max(edge.from, edge.to)};
+        auto cached = validation_cache.find(key);
+        if (cached == validation_cache.end()) {
+            const TopologyMapView::EvidenceState state = lineEvidence(
+                edge.from_position, edge.to_position, map_view);
+            cached = validation_cache.emplace(key, state).first;
+        }
+        if (cached->second == TopologyMapView::EvidenceState::KNOWN_FREE ||
+            (cached->second == TopologyMapView::EvidenceState::UNKNOWN &&
+             edge.existed)) {
             valid_edges.push_back(edge);
         }
     }
 
+    // Cap neighbors only after collision/evidence validation. Otherwise an
+    // invalid group of close candidates can consume the complete budget and
+    // disconnect otherwise reachable height layers.
+    std::unordered_map<NodeId, std::vector<CandidateEdge>> valid_by_source;
+    valid_by_source.reserve(source_ids.size());
+    for (const CandidateEdge &edge : valid_edges) {
+        valid_by_source[edge.from].push_back(edge);
+    }
+    valid_edges.clear();
+    const auto nearestFirst = [](const CandidateEdge &lhs,
+                                 const CandidateEdge &rhs) {
+        if (lhs.existed != rhs.existed) {
+            return lhs.existed;
+        }
+        // Reserve connectivity across region boundaries before spending the
+        // degree budget on redundant links inside one dense local cluster.
+        if (lhs.crosses_region != rhs.crosses_region) {
+            return lhs.crosses_region;
+        }
+        if (std::abs(lhs.distance - rhs.distance) > 1.0e-9) {
+            return lhs.distance < rhs.distance;
+        }
+        return lhs.to < rhs.to;
+    };
+    for (const NodeId source_id : source_ids) {
+        auto found = valid_by_source.find(source_id);
+        if (found == valid_by_source.end()) {
+            continue;
+        }
+        std::vector<CandidateEdge> &local = found->second;
+        std::sort(local.begin(), local.end(), nearestFirst);
+        if (config_.construction_mode !=
+            ConstructionMode::DENSE_KNOWN_FREE_DEBUG) {
+            // Existing connectivity is committed memory. Retain every still
+            // valid historic edge and use the budget only for new additions.
+            std::size_t new_edge_count = 0;
+            for (const CandidateEdge &edge : local) {
+                if (edge.existed || new_edge_count < config_.max_neighbors) {
+                    valid_edges.push_back(edge);
+                    if (!edge.existed) {
+                        ++new_edge_count;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // A dense lattice must never lose its local connectivity because of a
+        // visualization/performance neighbor budget. Keep every valid
+        // 8-neighbor (2D) / 26-neighbor (3D) lattice edge first, then use the
+        // configured budget only for longer shortcut edges.
+        std::vector<CandidateEdge> selected;
+        selected.reserve(std::max(config_.max_neighbors, local.size()));
+        const auto alreadySelected = [&selected](const NodeId id) {
+            return std::any_of(
+                selected.begin(), selected.end(),
+                [id](const CandidateEdge &edge) { return edge.to == id; });
+        };
+        for (const CandidateEdge &edge : local) {
+            const rog_map::Vec3f delta =
+                (edge.to_position - edge.from_position).cwiseAbs();
+            const bool adjacent_xy =
+                delta.x() <= config_.sample_spacing + 1.0e-9 &&
+                delta.y() <= config_.sample_spacing + 1.0e-9;
+            const bool adjacent_z = config_.planar_mode
+                ? delta.z() <= 1.0e-9
+                : delta.z() <= config_.sample_spacing + 1.0e-9;
+            if (adjacent_xy && adjacent_z) {
+                selected.push_back(edge);
+            }
+        }
+
+        // Also retain the closest valid portal above and below when known-free
+        // layers are farther apart than one lattice cell.
+        const auto appendBestVertical = [&](const bool above) {
+            const CandidateEdge *best = nullptr;
+            double best_horizontal = std::numeric_limits<double>::infinity();
+            double best_vertical = std::numeric_limits<double>::infinity();
+            for (const CandidateEdge &edge : local) {
+                const rog_map::Vec3f delta =
+                    edge.to_position - edge.from_position;
+                if ((above && delta.z() <= 1.0e-9) ||
+                    (!above && delta.z() >= -1.0e-9)) {
+                    continue;
+                }
+                const double horizontal = delta.head<2>().squaredNorm();
+                const double vertical = std::abs(delta.z());
+                if (horizontal < best_horizontal - 1.0e-9 ||
+                    (std::abs(horizontal - best_horizontal) <= 1.0e-9 &&
+                     (vertical < best_vertical - 1.0e-9 ||
+                      (std::abs(vertical - best_vertical) <= 1.0e-9 &&
+                       (!best || edge.to < best->to))))) {
+                    best = &edge;
+                    best_horizontal = horizontal;
+                    best_vertical = vertical;
+                }
+            }
+            if (best && !alreadySelected(best->to)) {
+                selected.push_back(*best);
+            }
+        };
+        if (!config_.planar_mode) {
+            appendBestVertical(true);
+            appendBestVertical(false);
+        }
+        const std::size_t neighbor_budget =
+            std::max(config_.max_neighbors, selected.size());
+        for (const CandidateEdge &edge : local) {
+            if (selected.size() >= neighbor_budget) {
+                break;
+            }
+            if (!alreadySelected(edge.to)) {
+                selected.push_back(edge);
+            }
+        }
+        valid_edges.insert(valid_edges.end(), selected.begin(), selected.end());
+    }
+
+    // Apply existing edges first. New undirected edges are admitted only when
+    // both endpoint degrees have capacity, so max_neighbors is a real graph
+    // degree bound rather than a per-source candidate bound.
+    std::sort(valid_edges.begin(), valid_edges.end(), nearestFirst);
     std::unique_lock<std::shared_mutex> lock(graph_mutex_);
     for (const NodeId source_id : source_ids) {
         const auto source_it = nodes_.find(source_id);
@@ -1006,6 +1598,13 @@ void IncrementalTopologyGraph::rebuildIncidentEdges(
         if (from_it == nodes_.end() || to_it == nodes_.end() ||
             !samePosition(from_it->second.node.position, edge.from_position) ||
             !samePosition(to_it->second.node.position, edge.to_position)) {
+            continue;
+        }
+        if (config_.construction_mode ==
+                ConstructionMode::PERSISTENT_BUBBLE_SKELETON &&
+            !edge.existed &&
+            (from_it->second.neighbors.size() >= config_.max_neighbors ||
+             to_it->second.neighbors.size() >= config_.max_neighbors)) {
             continue;
         }
         from_it->second.neighbors[edge.to] = edge.distance;
@@ -1057,8 +1656,11 @@ std::size_t IncrementalTopologyGraph::update(const TopologyMapView &map_view,
     }
     std::size_t rebuilt = 0;
     RegionKey region;
-    while (rebuilt < max_regions && popDirtyRegion(region, focus)) {
-        rebuildRegion(region, map_view);
+    std::vector<RegionKey> changed_dense_cells;
+    rog_map::vec_Vec3f evidence_seeds;
+    while (rebuilt < max_regions &&
+           popDirtyRegion(region, changed_dense_cells, evidence_seeds, focus)) {
+        rebuildRegion(region, changed_dense_cells, evidence_seeds, map_view);
         ++rebuilt;
     }
     if (rebuilt > 0 && config_.snapshot_every_update) {
@@ -1076,13 +1678,23 @@ IncrementalTopologyGraph::Snapshot IncrementalTopologyGraph::snapshot() const {
     Snapshot output;
     const auto search = acquireSearchSnapshot();
     if (search) {
-        output.dense_known_free = search->config.dense_known_free;
+        output.construction_mode = search->config.construction_mode;
         output.nodes.reserve(search->graph.size());
         for (const auto &entry : search->graph) {
             output.nodes.push_back(entry.second.node);
             for (const auto &neighbor : entry.second.neighbors) {
                 if (entry.first < neighbor.first) {
-                    output.edges.push_back({entry.first, neighbor.first, neighbor.second});
+                    Edge edge;
+                    edge.from = entry.first;
+                    edge.to = neighbor.first;
+                    edge.cost = neighbor.second;
+                    edge.validated_revision = search->revision;
+                    const auto target = search->graph.find(neighbor.first);
+                    if (target != search->graph.end()) {
+                        edge.polyline = {entry.second.node.position,
+                                         target->second.node.position};
+                    }
+                    output.edges.push_back(std::move(edge));
                 }
             }
         }
@@ -1098,15 +1710,7 @@ IncrementalTopologyGraph::Snapshot IncrementalTopologyGraph::snapshot() const {
         output.last_clearance_rejected_count =
             last_candidate_diagnostics_.clearance_rejected_count;
     }
-    {
-        std::shared_lock<std::shared_mutex> evidence_lock(
-            dense_evidence_mutex_);
-        for (const auto &entry : dense_evidence_) {
-            output.dense_evidence_cell_count +=
-                entry.second.free_count > 0 &&
-                entry.second.occupied_count == 0 ? 1U : 0U;
-        }
-    }
+    output.known_free_cell_count = output.nodes.size();
     std::lock_guard<std::mutex> dirty_lock(dirty_mutex_);
     output.dirty_region_count = dirty_regions_.size();
     return output;
@@ -1138,15 +1742,7 @@ IncrementalTopologyGraph::Stats IncrementalTopologyGraph::stats() const {
         output.last_clearance_rejected_count =
             last_candidate_diagnostics_.clearance_rejected_count;
     }
-    {
-        std::shared_lock<std::shared_mutex> evidence_lock(
-            dense_evidence_mutex_);
-        for (const auto &entry : dense_evidence_) {
-            output.dense_evidence_cell_count +=
-                entry.second.free_count > 0 &&
-                entry.second.occupied_count == 0 ? 1U : 0U;
-        }
-    }
+    output.known_free_cell_count = output.node_count;
     std::lock_guard<std::mutex> dirty_lock(dirty_mutex_);
     output.dirty_region_count = dirty_regions_.size();
     return output;
@@ -1242,15 +1838,35 @@ bool IncrementalTopologyGraph::findPath(
     const std::size_t max_attach = std::min(query_config.max_neighbors,
                                              start_candidates.size());
 
-    using QueueEntry = std::pair<double, NodeId>;
+    struct QueueEntry {
+        double estimated_total_cost{0.0};
+        double path_cost{0.0};
+        NodeId node_id{0};
+    };
+    // Edge cost is Euclidean node distance, so Euclidean distance to the goal
+    // is admissible and consistent.  The tie-breaker keeps route selection
+    // deterministic when two nodes have the same f score.
+    const auto lowerEstimatedCost = [](const QueueEntry &lhs,
+                                       const QueueEntry &rhs) {
+        if (std::abs(lhs.estimated_total_cost - rhs.estimated_total_cost) > 1.0e-12) {
+            return lhs.estimated_total_cost > rhs.estimated_total_cost;
+        }
+        if (std::abs(lhs.path_cost - rhs.path_cost) > 1.0e-12) {
+            return lhs.path_cost > rhs.path_cost;
+        }
+        return lhs.node_id > rhs.node_id;
+    };
     std::priority_queue<QueueEntry, std::vector<QueueEntry>,
-                        std::greater<QueueEntry>> queue;
+                        decltype(lowerEstimatedCost)> queue(lowerEstimatedCost);
     std::unordered_map<NodeId, double> distance;
     std::unordered_map<NodeId, NodeId> parent;
     for (std::size_t i = 0; i < max_attach; ++i) {
-        distance[start_candidates[i].second] = start_candidates[i].first;
-        parent[start_candidates[i].second] = 0;
-        queue.push(start_candidates[i]);
+        const NodeId start_id = start_candidates[i].second;
+        const double path_cost = start_candidates[i].first;
+        distance[start_id] = path_cost;
+        parent[start_id] = 0;
+        queue.push({path_cost + (graph.at(start_id).node.position - goal).norm(),
+                    path_cost, start_id});
     }
 
     double best_goal_cost = std::numeric_limits<double>::infinity();
@@ -1258,19 +1874,21 @@ bool IncrementalTopologyGraph::findPath(
     while (!queue.empty()) {
         const QueueEntry current = queue.top();
         queue.pop();
-        const auto distance_it = distance.find(current.second);
-        if (distance_it == distance.end() || current.first > distance_it->second + 1.0e-12) {
+        const auto distance_it = distance.find(current.node_id);
+        if (distance_it == distance.end() ||
+            current.path_cost > distance_it->second + 1.0e-12) {
             continue;
         }
-        if (current.first >= best_goal_cost) {
+        if (current.estimated_total_cost >= best_goal_cost) {
             break;
         }
-        const auto goal_it = goal_links.find(current.second);
-        if (goal_it != goal_links.end() && current.first + goal_it->second < best_goal_cost) {
-            best_goal_cost = current.first + goal_it->second;
-            best_goal_parent = current.second;
+        const auto goal_it = goal_links.find(current.node_id);
+        if (goal_it != goal_links.end() &&
+            current.path_cost + goal_it->second < best_goal_cost) {
+            best_goal_cost = current.path_cost + goal_it->second;
+            best_goal_parent = current.node_id;
         }
-        const auto graph_it = graph.find(current.second);
+        const auto graph_it = graph.find(current.node_id);
         if (graph_it == graph.end()) {
             continue;
         }
@@ -1278,12 +1896,14 @@ bool IncrementalTopologyGraph::findPath(
             if (graph.count(neighbor.first) == 0U) {
                 continue;
             }
-            const double proposed = current.first + neighbor.second;
+            const double proposed = current.path_cost + neighbor.second;
             const auto known = distance.find(neighbor.first);
             if (known == distance.end() || proposed < known->second) {
                 distance[neighbor.first] = proposed;
-                parent[neighbor.first] = current.second;
-                queue.emplace(proposed, neighbor.first);
+                parent[neighbor.first] = current.node_id;
+                queue.push({proposed +
+                                (graph.at(neighbor.first).node.position - goal).norm(),
+                            proposed, neighbor.first});
             }
         }
     }

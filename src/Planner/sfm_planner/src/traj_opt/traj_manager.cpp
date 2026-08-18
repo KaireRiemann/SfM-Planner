@@ -511,7 +511,11 @@ vec_E<Vec3f> estimateGuideVelocities(const vec_E<Vec3f> &path,
 
 ExpTrajOpt::ExpTrajOpt(const traj_opt::Config &cfg,
                        const ros_interface::RosInterface::Ptr &ros_ptr)
-    : cfg_(cfg), ros_ptr_(ros_ptr)
+    : cfg_(cfg),
+      nominal_max_vel_(cfg.max_vel),
+      nominal_max_acc_(cfg.max_acc),
+      nominal_max_jerk_(cfg.max_jerk),
+      ros_ptr_(ros_ptr)
 {
   const auto active_penalties = cfg_.activePenaltyWeights();
   if (cfg_.save_log_en)
@@ -745,6 +749,41 @@ void ExpTrajOpt::setSwarmTrajectories(const SwarmTrajectoriesConstPtr &trajector
 void ExpTrajOpt::setSwarmCurrentWallTime(double wall_time)
 {
   swarm_current_wall_time_ = wall_time;
+}
+
+void ExpTrajOpt::setMotionLimits(double max_vel,
+                                 double max_acc,
+                                 double max_jerk)
+{
+  const bool requested = std::isfinite(max_vel) && std::isfinite(max_acc) &&
+                         std::isfinite(max_jerk) &&
+                         max_vel > 0.0 && max_acc > 0.0 && max_jerk > 0.0;
+  const double next_max_vel = requested ? std::min(nominal_max_vel_, max_vel)
+                                        : nominal_max_vel_;
+  const double next_max_acc = requested ? std::min(nominal_max_acc_, max_acc)
+                                        : nominal_max_acc_;
+  const double next_max_jerk = requested ? std::min(nominal_max_jerk_, max_jerk)
+                                         : nominal_max_jerk_;
+  if (std::abs(cfg_.max_vel - next_max_vel) < 1.0e-9 &&
+      std::abs(cfg_.max_acc - next_max_acc) < 1.0e-9 &&
+      std::abs(cfg_.max_jerk - next_max_jerk) < 1.0e-9) {
+    return;
+  }
+
+  cfg_.max_vel = next_max_vel;
+  cfg_.max_acc = next_max_acc;
+  cfg_.max_jerk = next_max_jerk;
+  if (opt_vars_.magnitude_bounds.size() >= 3) {
+    opt_vars_.magnitude_bounds(0) = cfg_.max_vel;
+    opt_vars_.magnitude_bounds(1) = cfg_.max_acc;
+    opt_vars_.magnitude_bounds(2) = cfg_.max_jerk;
+  }
+  // A warm start produced at a different dynamic scale is only a numerical
+  // hint; discard it rather than allowing it to pull a capture leg back
+  // toward the high-speed navigation solution.
+  warm_start_cache_.valid = false;
+  phase2_cached_signature_ = 0;
+  phase2_cached_multipliers_.resize(0);
 }
 
 void ExpTrajOpt::setGuideZFloorReference(double altitude)
@@ -1950,6 +1989,12 @@ double ExpTrajOpt::optimize(Trajectory &traj, double rel_cost_tol)
   opt_vars_.fast_fallback_used = false;
   double min_cost = 0.0;
 
+  // Preserve the guide-derived seed before a cross-replan warm start can
+  // replace x.  A warm solution is an optimisation hint, not an invariant:
+  // when its line search fails on a short capture leg, the numerical fallback
+  // must retry the fresh guide seed instead of repeating the same warm start.
+  const VecDf guide_initial_decision = x;
+
   optimizer_.resetTimingStatistics();
   const auto optimization_begin = std::chrono::steady_clock::now();
   {
@@ -2028,8 +2073,6 @@ double ExpTrajOpt::optimize(Trajectory &traj, double rel_cost_tol)
                                       warm_begin)
             .count();
   }
-  const VecDf initial_decision = x;
-
   const bool early_stop_enabled = opt_vars_.lbfgs_fast_enabled;
   configureFastLbfgs(rel_cost_tol,
                      early_stop_enabled,
@@ -2053,7 +2096,7 @@ double ExpTrajOpt::optimize(Trajectory &traj, double rel_cost_tol)
                         this,
                         &ExpTrajOpt::fastLbfgsSnapshot,
                         /*allow_fallback=*/true,
-                        &initial_decision);
+                        &guide_initial_decision);
   syncFastLbfgsReport();
 
   // The stable production line keeps the continuous oracle read-only. The
@@ -2511,6 +2554,18 @@ double ExpTrajOpt::optimize(Trajectory &traj, double rel_cost_tol)
               << ", guide_cost_sample=" << opt_vars_.guide_path_cost_log
               << ", guide_max_abs_gt=" << opt_vars_.guide_path_max_abs_time_grad
               << ", guide_oob_samples=" << opt_vars_.guide_path_out_of_time_range_samples
+              << ", pieces=" << opt_vars_.piece_num
+              << ", guide_points=" << opt_vars_.guide_path.size()
+              << ", endpoint_distance="
+              << (opt_vars_.tail_pvaj.col(0) - opt_vars_.head_pvaj.col(0)).norm()
+              << ", warm_start_status=" << opt_vars_.warm_start_status
+              << ", warm_start_accepted="
+              << (opt_vars_.warm_start_accepted ? 1 : 0)
+              << ", fallback_used="
+              << (opt_vars_.fast_fallback_used ? 1 : 0)
+              << ", line_search_evals=" << opt_vars_.line_search_evaluations
+              << ", max_line_search_evals="
+              << opt_vars_.max_line_search_evaluations
               << RESET << std::endl;
     return INFINITY;
   }

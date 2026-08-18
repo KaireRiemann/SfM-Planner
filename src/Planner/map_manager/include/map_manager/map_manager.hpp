@@ -38,6 +38,20 @@ public:
         setMap(map);
     }
 
+    ~MapManager()
+    {
+        // Detach ROG callbacks while every member they refer to is still
+        // alive. This makes Ctrl-C shutdown deterministic and prevents a late
+        // map callback from racing topology container destruction.
+        if (map_) {
+            map_->setStateChangeCallback({});
+            map_->setRobotStateCallback({});
+        }
+        if (topology_graph_) {
+            topology_graph_->setActive(false);
+        }
+    }
+
     void setMap(const rog_map::ROGMapROS::Ptr &map)
     {
         if (map_) {
@@ -77,43 +91,19 @@ public:
                 }
             });
 
-            // Odom only prioritizes asynchronous maintenance in dense
-            // known-free mode. New graph content comes from post-integration
-            // occupancy transitions, never from robot motion itself.
-            struct OdomTopologyTrigger {
-                std::mutex mutex;
-                bool initialized{false};
-                rog_map::Vec3f last_marked{rog_map::Vec3f::Zero()};
-            };
-            const auto trigger = std::make_shared<OdomTopologyTrigger>();
+            // Odom prioritizes maintenance and keeps the current 4 m cell on
+            // the dirty queue while it is still inside the rolling window.
+            // A 50 m inspection map otherwise finishes rebuilding a region
+            // only after the local KNOWN_FREE evidence has already slid away.
             map_->setRobotStateCallback(
-                [weak_topology, trigger](const rog_map::RobotState &robot) {
+                [weak_topology](const rog_map::RobotState &robot) {
                     const auto topology = weak_topology.lock();
                     if (!topology || !topology->active() || !robot.rcv ||
                         !robot.p.allFinite()) {
                         return;
                     }
                     topology->requestUpdateFocus(robot.p);
-                    const auto config = topology->config();
-                    const double trigger_distance =
-                        std::max(0.5, 0.5 * config.region_size);
-                    bool mark = false;
-                    {
-                        std::lock_guard<std::mutex> lock(trigger->mutex);
-                        rog_map::Vec3f delta = robot.p - trigger->last_marked;
-                        if (config.planar_mode) {
-                            delta.z() = 0.0;
-                        }
-                        mark = !trigger->initialized ||
-                               delta.norm() >= trigger_distance;
-                        if (mark) {
-                            trigger->initialized = true;
-                            trigger->last_marked = robot.p;
-                        }
-                    }
-                    if (mark && !config.dense_known_free) {
-                        topology->markDirty(robot.p);
-                    }
+                    topology->markDirty(robot.p);
                 });
         }
     }
@@ -143,6 +133,23 @@ public:
         return map_->getMapConfig();
     }
 
+    /**
+     * Mask a previous tunnel-face thin slab from the prior map so blasted
+     * walls do not block the next approach. Returns cleared cell count.
+     */
+    int maskChangeRegion(const rog_map::Vec3f &center,
+                         const rog_map::Vec3f &normal,
+                         const double width,
+                         const double height,
+                         const double thickness) const
+    {
+        if (!map_ || width <= 0.0 || height <= 0.0 || thickness <= 0.0) {
+            return 0;
+        }
+        return map_->forceUnknownInOrientedBox(center, normal, width, height,
+                                               thickness);
+    }
+
     UpdateSnapshot updateMap(const rog_map::PointCloud &cloud,
                              const general_utils::Pose &pose) const
     {
@@ -166,6 +173,19 @@ public:
     std::uint64_t mapRevision() const
     {
         return map_revision_.load(std::memory_order_acquire);
+    }
+
+    // Read-side task adapters use this generation only to invalidate cached
+    // global-route intent; it never changes map or topology ownership.
+    std::uint64_t worldEpoch() const
+    {
+        return world_epoch_.load(std::memory_order_acquire);
+    }
+
+    void setWorldEpoch(const std::uint64_t epoch)
+    {
+        world_epoch_.store(std::max<std::uint64_t>(1, epoch),
+                           std::memory_order_release);
     }
 
     UpdateSnapshot latestUpdate() const
@@ -259,6 +279,14 @@ public:
         }
     }
 
+    /** Feed only already map-verified executed motion into topo construction. */
+    void observeVerifiedTopologyPath(const rog_map::vec_Vec3f &path) const
+    {
+        if (topologyReady()) {
+            topology_graph_->observeVerifiedPath(path);
+        }
+    }
+
     IncrementalTopologyGraph::Snapshot topologySnapshot() const
     {
         return topology_graph_ ? topology_graph_->snapshot()
@@ -286,6 +314,7 @@ public:
             path.clear();
             return false;
         }
+        syncBoundaryMap();
         return topology_graph_->findPath(start, goal, makeTopologyQuery(),
                                          path, attach_radius);
     }
@@ -301,6 +330,7 @@ public:
             path.clear();
             return false;
         }
+        syncBoundaryMap();
         return topology_graph_->findPath(snapshot, start, goal,
                                          makeTopologyQuery(), path,
                                          attach_radius);
@@ -591,9 +621,8 @@ public:
 private:
     /**
      * Delay the initial dirty-window seed until the first real odometry has
-     * initialized ROG's sliding-map origin. Dense mode then samples only
-     * observed known-free cells; legacy unknown-as-free mode is likewise
-     * prevented from creating nodes around the default origin.
+     * initialized ROG's sliding-map origin. Prefer the latest observed update
+     * box so an empty rolling window does not enqueue hundreds of regions.
      */
     bool seedTopologyFromCurrentWindow() const
     {
@@ -607,16 +636,25 @@ private:
         bool expected = false;
         if (topology_seeded_.compare_exchange_strong(
                 expected, true, std::memory_order_acq_rel)) {
-            if (topology_graph_->config().dense_known_free) {
-                // Dense mode persists map transitions while state2state owns
-                // it. Seeding the full rolling window would enqueue hundreds
-                // of mostly empty regions and starve moving updates.
-                return true;
+            topology_graph_->requestUpdateFocus(robot.p);
+            const UpdateSnapshot latest = latestUpdate();
+            if (latest.revision > 0 && latest.changed_box_valid) {
+                topology_graph_->markDirtyBox(latest.changed_min,
+                                               latest.changed_max);
+            } else if (rog_map::Vec3f changed_min, changed_max;
+                       map_->getUpdatedBox(changed_min, changed_max)) {
+                // ROGMapROS normally owns point-cloud fusion directly, so
+                // MapManager::updateMap() is not necessarily the code path
+                // that produced this map.  Read the map's own latest box
+                // before falling back to a single odom cell.
+                topology_graph_->markDirtyBox(changed_min, changed_max);
+            } else {
+                // A 50 x 50 x 16 m inspection window is hundreds of 3-D
+                // regions. Seeding all of them starves the tunnel corridor
+                // that is actually observed. Only the robot cell is queued;
+                // later LiDAR transitions dirty the rest.
+                topology_graph_->markDirty(robot.p);
             }
-            rog_map::Vec3f box_min(-1.0e6, -1.0e6, -1.0e6);
-            rog_map::Vec3f box_max(1.0e6, 1.0e6, 1.0e6);
-            map_->boundBoxByLocalMap(box_min, box_max);
-            topology_graph_->markDirtyBox(box_min, box_max);
         }
         return true;
     }
@@ -628,60 +666,46 @@ private:
     IncrementalTopologyGraph::Query makeTopologyQuery() const
     {
         IncrementalTopologyGraph::Query query;
-        const auto topology_config = topology_graph_
-            ? topology_graph_->config()
-            : IncrementalTopologyGraph::Config{};
-        const bool unknown_as_free =
-            topology_config.unknown_as_free &&
-            !topology_config.dense_known_free;
-        const bool dense_known_free = topology_config.dense_known_free;
-        query.traversable = [this, unknown_as_free, dense_known_free](
-                                const rog_map::Vec3f &position) {
+        const rog_map::Config map_config = map_
+            ? map_->getMapConfig() : rog_map::Config{};
+        query.evidence = [this, map_config](const rog_map::Vec3f &position) {
+            using EvidenceState = TopologyMapView::EvidenceState;
             if (!map_ || !position.allFinite()) {
-                return false;
+                return EvidenceState::UNKNOWN;
             }
-            const rog_map::Config config = map_->getMapConfig();
-            if (position.z() <= config.virtual_ground_height ||
-                position.z() >= config.virtual_ceil_height) {
-                return false;
+            if (position.z() <= map_config.virtual_ground_height ||
+                position.z() >= map_config.virtual_ceil_height) {
+                return EvidenceState::OCCUPIED;
             }
             if (map_->insideLocalMap(position)) {
                 const rog_map::GridType raw = map_->getGridType(position);
-                const rog_map::GridType inflated =
-                    map_->getInfGridType(position);
-                const bool inflation_safe =
-                    inflated != rog_map::GridType::OCCUPIED &&
-                    inflated != rog_map::GridType::OUT_OF_MAP;
-                if (raw == rog_map::GridType::KNOWN_FREE) {
-                    // Dense topology records observed free-space evidence.
-                    // The inflated layer is a planning/safety representation
-                    // and may conservatively mark an entire narrow flight
-                    // layer occupied. It must not erase valid raw-map memory.
-                    if (dense_known_free) {
-                        return true;
-                    }
-                    return inflation_safe &&
-                           (unknown_as_free || inflated == rog_map::GridType::KNOWN_FREE);
-                }
                 if (raw == rog_map::GridType::OCCUPIED) {
-                    return false;
+                    return EvidenceState::OCCUPIED;
                 }
-                if (dense_known_free) {
-                    // Never promote UNKNOWN via lattice proximity. Every
-                    // stored dense node must lie in a raw KNOWN_FREE voxel.
-                    return false;
+                if (raw == rog_map::GridType::KNOWN_FREE) {
+                    const rog_map::GridType inflated =
+                        map_->getInfGridType(position);
+                    return inflated == rog_map::GridType::OCCUPIED ||
+                           inflated == rog_map::GridType::OUT_OF_MAP
+                        ? EvidenceState::OCCUPIED
+                        : EvidenceState::KNOWN_FREE;
                 }
-                // This option is explicit because ordinary state2state may be
-                // configured to plan through unknown cells. It is restricted
-                // to the current local map; unseen global space is never
-                // promoted to persistent free space.
-                if (unknown_as_free) {
-                    return inflation_safe;
-                }
+                // A local ring-buffer UNKNOWN does not override older global
+                // evidence. This is the persistence rule which prevents ROG
+                // sliding from erasing the committed topology.
             }
-            return boundary_map_ &&
-                   boundary_map_->getGridType(position) ==
-                   rog_map::GridType::KNOWN_FREE;
+            if (!boundary_map_) {
+                return EvidenceState::UNKNOWN;
+            }
+            const rog_map::GridType global =
+                boundary_map_->getGridType(position);
+            if (global == rog_map::GridType::KNOWN_FREE) {
+                return EvidenceState::KNOWN_FREE;
+            }
+            if (global == rog_map::GridType::OCCUPIED) {
+                return EvidenceState::OCCUPIED;
+            }
+            return EvidenceState::UNKNOWN;
         };
         query.clearance = [this](const rog_map::Vec3f &position, double &distance) {
             if (!map_ || !map_->insideLocalMap(position) || !map_->hasESDF()) {
@@ -699,6 +723,7 @@ private:
         std::make_shared<IncrementalTopologyGraph>()};
     mutable std::atomic<bool> topology_seeded_{false};
     mutable std::atomic<std::uint64_t> map_revision_{0};
+    std::atomic<std::uint64_t> world_epoch_{1};
     mutable std::mutex update_snapshot_mutex_;
     mutable UpdateSnapshot latest_update_;
 };

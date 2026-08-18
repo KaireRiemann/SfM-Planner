@@ -157,6 +157,130 @@ namespace general_planner {
         gi_.new_goal = false;
     }
 
+    void GeneralPlanner::setState2StateTopologyPolicy(const bool enabled) {
+        state2state_topology_route_runtime_.setPolicy(enabled);
+    }
+
+    void GeneralPlanner::setState2StateTopologyTaskEpoch(
+            const std::uint64_t epoch) {
+        state2state_topology_route_runtime_.setTaskEpoch(epoch);
+    }
+
+    void GeneralPlanner::setState2StateMotionLimits(const double max_vel,
+                                                     const double max_acc,
+                                                     const double max_jerk) {
+        const bool valid_override = std::isfinite(max_vel) && std::isfinite(max_acc) &&
+                                    std::isfinite(max_jerk) &&
+                                    max_vel > 0.0 && max_acc > 0.0 && max_jerk > 0.0;
+        if (valid_override) {
+            state2state_motion_limits_.max_vel =
+                    std::min(cfg_.exp_traj_cfg.max_vel, max_vel);
+            state2state_motion_limits_.max_acc =
+                    std::min(cfg_.exp_traj_cfg.max_acc, max_acc);
+            state2state_motion_limits_.max_jerk =
+                    std::min(cfg_.exp_traj_cfg.max_jerk, max_jerk);
+        } else {
+            state2state_motion_limits_ = state2state_task::State2StateMotionLimits{};
+        }
+
+        if (traj_manager_ && traj_manager_->exp()) {
+            traj_manager_->exp()->setMotionLimits(
+                    state2state_motion_limits_.max_vel,
+                    state2state_motion_limits_.max_acc,
+                    state2state_motion_limits_.max_jerk);
+        }
+    }
+
+    void GeneralPlanner::beginState2StateReturnBreadcrumb(const Vec3f &home) {
+        std::lock_guard<std::mutex> lock(replan_lock_);
+        auto &runtime = state2state_topology_route_runtime_;
+        resetGlobalTopologyRoute(runtime.route, "BREADCRUMB_MISSION_RESET");
+        resetVerifiedBreadcrumb(runtime.breadcrumb, home);
+        if (runtime.breadcrumb.active) {
+            ros_ptr_->info(
+                " -- [GeneralPlanner] Return breadcrumb anchored at home=[{:.2f},{:.2f},{:.2f}].",
+                home.x(), home.y(), home.z());
+        } else {
+            ros_ptr_->warn(
+                " -- [GeneralPlanner] Return breadcrumb was not armed: invalid home pose.");
+        }
+    }
+
+    void GeneralPlanner::observeState2StateReturnBreadcrumb(
+            const Vec3f &position) {
+        if (!cfg_.state2state_topology_breadcrumb_enable ||
+            !position.allFinite() || map_manager_ == nullptr) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(replan_lock_);
+        auto &breadcrumb = state2state_topology_route_runtime_.breadcrumb;
+        if (!breadcrumb.active || breadcrumb.path.empty()) {
+            return;
+        }
+        const Vec3f last = breadcrumb.path.back();
+        const double distance = (position - last).norm();
+        const double spacing = std::max(
+            0.05, cfg_.state2state_topology_breadcrumb_spacing);
+        if (!std::isfinite(distance) || distance < spacing) {
+            return;
+        }
+        const int max_points = std::max(
+            2, cfg_.state2state_topology_breadcrumb_max_points);
+        const double max_segment = std::max(
+            spacing, cfg_.state2state_topology_breadcrumb_max_segment);
+        const int segments = std::max(1, static_cast<int>(std::ceil(
+            distance / max_segment)));
+        if (breadcrumb.path.size() + static_cast<std::size_t>(segments) >
+            static_cast<std::size_t>(max_points)) {
+            breadcrumb.last_result = "BREADCRUMB_CAPACITY_REACHED";
+            return;
+        }
+
+        const double map_resolution = std::max(
+            0.05, map_manager_->getResolution());
+        const double check_step = std::min(
+            map_resolution, 0.25 * max_segment);
+        const auto knownFree = [&](const Vec3f &point) {
+            if (!map_manager_->insideLocalMap(point) ||
+                map_manager_->getGridType(point) != rog_map::GridType::KNOWN_FREE) {
+                return false;
+            }
+            const rog_map::GridType inflated = map_manager_->getInfGridType(point);
+            return inflated != rog_map::GridType::OCCUPIED &&
+                   inflated != rog_map::GridType::OUT_OF_MAP;
+        };
+        const auto verifiedSegment = [&](const Vec3f &from, const Vec3f &to) {
+            const double length = (to - from).norm();
+            const int samples = std::max(1, static_cast<int>(std::ceil(
+                length / check_step)));
+            for (int i = 0; i <= samples; ++i) {
+                const Vec3f sample = from +
+                    (static_cast<double>(i) / samples) * (to - from);
+                if (!knownFree(sample)) {
+                    return false;
+                }
+            }
+            return map_manager_->isLineFree(from, to, true, true);
+        };
+
+        rog_map::vec_Vec3f verified_path;
+        verified_path.push_back(last);
+        Vec3f previous = last;
+        for (int i = 1; i <= segments; ++i) {
+            const Vec3f next = last +
+                (static_cast<double>(i) / segments) * (position - last);
+            if (!verifiedSegment(previous, next)) {
+                breadcrumb.last_result = "BREADCRUMB_SEGMENT_NOT_KNOWN_FREE";
+                return;
+            }
+            appendVerifiedBreadcrumb(breadcrumb, next);
+            verified_path.push_back(next);
+            previous = next;
+        }
+        map_manager_->observeVerifiedTopologyPath(verified_path);
+    }
+
     GeneralPlanner::GeneralPlanner
             (const std::string &cfg_path,
              const ros_interface::RosInterface::Ptr &ros_ptr,
@@ -180,11 +304,12 @@ namespace general_planner {
         }
         IncrementalTopologyGraph::Config topology_config;
         topology_config.enabled = cfg_.state2state_topology_enable;
-        topology_config.dense_known_free =
-            cfg_.state2state_topology_construction_mode == "dense_known_free";
+        topology_config.construction_mode =
+            IncrementalTopologyGraph::constructionModeFromString(
+                cfg_.state2state_topology_construction_mode);
         topology_config.unknown_as_free = cfg_.state2state_topology_unknown_as_free;
         topology_config.snapshot_every_update =
-            cfg_.state2state_topology_query_enable;
+            cfg_.state2state_topology_query_capability_enable;
         topology_config.planar_mode = cfg_.state2state_topology_planar_mode;
         const auto topology_map_config = map_manager_->getMapConfig();
         const bool explicit_topology_altitude =
@@ -199,13 +324,17 @@ namespace general_planner {
                      topology_map_config.virtual_ceil_height);
         topology_config.region_size = cfg_.state2state_topology_region_size;
         topology_config.sample_spacing = cfg_.state2state_topology_sample_spacing;
-        topology_config.dense_evidence_vertical_tolerance =
-            cfg_.state2state_topology_evidence_vertical_tolerance;
         topology_config.min_clearance = std::max(
             cfg_.state2state_topology_min_clearance, cfg_.robot_r);
         topology_config.max_clearance = cfg_.state2state_topology_max_clearance;
+        topology_config.candidate_separation =
+            cfg_.state2state_topology_candidate_separation;
+        topology_config.stable_match_distance =
+            cfg_.state2state_topology_stable_match_distance;
         topology_config.connection_radius =
             cfg_.state2state_topology_connection_radius;
+        topology_config.edge_sample_spacing =
+            cfg_.state2state_topology_edge_sample_spacing;
         topology_config.dirty_padding = cfg_.state2state_topology_dirty_padding;
         topology_config.bubble_overlap_margin =
             cfg_.state2state_topology_bubble_overlap_margin;
@@ -225,15 +354,15 @@ namespace general_planner {
         if (topology_config.enabled) {
             ros_ptr_->info(
                 " -- [GeneralPlanner] Incremental topology enabled: mode={}, region={:.2f}m, cell={:.2f}m, clearance={:.2f}m, unknown_as_free={}, planar={}, navigation_z={:.3f}m, planning_query={}.",
-                topology_config.dense_known_free
-                    ? "dense_known_free" : "bubble_topology",
+                IncrementalTopologyGraph::constructionModeName(
+                    topology_config.construction_mode),
                 topology_config.region_size,
                 topology_config.sample_spacing,
                 topology_config.min_clearance,
                 topology_config.unknown_as_free,
                 topology_config.planar_mode,
                 topology_config.navigation_altitude,
-                cfg_.state2state_topology_query_enable);
+                cfg_.state2state_topology_query_capability_enable);
         }
         ros_ptr_->setResolution(cfg_.resolution);
         ros_ptr_->setVisualizationEn(cfg_.visualization_en);

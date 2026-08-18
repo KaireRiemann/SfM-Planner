@@ -28,8 +28,13 @@
   <depend>map_manager</depend>
   <depend>traj_utils</depend>
 
+  <build_depend>message_generation</build_depend>
+  <exec_depend>message_runtime</exec_depend>
+
   <exec_depend>perfect_drone_sim</exec_depend>
   <exec_depend>marsim_render</exec_depend>
+  <exec_depend>rosbag</exec_depend>
+  <exec_depend>rviz</exec_depend>
 
   <export/>
 </package>

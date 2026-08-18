@@ -1,0 +1,28 @@
+<launch>
+    <!--
+      Offline inspection-bag viewer.
+
+      Pass a recorded .bag file to replay it with simulated time and open the
+      inspection-focused RViz layout.  Leave bag empty to open the same layout
+      against a live ROS graph.
+
+      Example:
+        roslaunch sfm_planner inspection_bag_rviz.launch \
+          bag:=/root/ws/SfM-Planner/bags/inspection_mission_YYYYMMDD_HHMMSS.bag
+    -->
+    <arg name="bag" default=""/>
+    <arg name="rate" default="1.0"/>
+    <arg name="rviz" default="true"/>
+    <arg name="rviz_config" default="$(find sfm_planner)/rviz/inspection_bag.rviz"/>
+
+    <!-- rosbag play publishes /clock; no active simulator/planner should be
+         running while replaying the bag. -->
+    <param name="/use_sim_time" value="$(eval 'true' if arg('bag') != '' else 'false')"/>
+
+    <node if="$(eval arg('bag') != '')" pkg="rosbag" type="play"
+          name="inspection_bag_play" output="screen"
+          args="--clock --rate $(arg rate) $(arg bag)"/>
+
+    <node if="$(arg rviz)" pkg="rviz" type="rviz" name="inspection_bag_rviz"
+          args="-d $(arg rviz_config)" output="log"/>
+</launch>

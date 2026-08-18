@@ -485,6 +485,9 @@ public:
   void setSwarmConfig(const SwarmPenaltyConfig &config);
   void setSwarmTrajectories(const SwarmTrajectoriesConstPtr &trajectories);
   void setSwarmCurrentWallTime(double wall_time);
+  /** Tighten P/V/A/J bounds for the next state2state task, or restore the
+   * constructor configuration when any requested limit is non-positive. */
+  void setMotionLimits(double max_vel, double max_acc, double max_jerk);
   // State2state supplies the precomputed soft z-floor reference. It affects
   // only the objective and never determines optimizer success/failure.
   void setGuideZFloorReference(double altitude);
@@ -656,6 +659,9 @@ private:
 
 private:
   traj_opt::Config cfg_;
+  const double nominal_max_vel_;
+  const double nominal_max_acc_;
+  const double nominal_max_jerk_;
   std::ofstream failed_traj_log_;
   std::ofstream penalty_log_;
   ros_interface::RosInterface::Ptr ros_ptr_;

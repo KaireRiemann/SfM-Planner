@@ -33,6 +33,27 @@ find_package(catkin REQUIRED COMPONENTS
         tf
 )
 
+add_message_files(
+        FILES
+        FaceObservation.msg
+        FaceDetectionRequest.msg
+        CaptureRequest.msg
+        CaptureResult.msg
+        MissionStatus.msg
+)
+
+add_service_files(
+        FILES
+        StartInspection.srv
+)
+
+generate_messages(
+        DEPENDENCIES
+        std_msgs
+        geometry_msgs
+        sensor_msgs
+)
+
 find_package(OpenMP REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(yaml-cpp REQUIRED)
@@ -45,7 +66,7 @@ catkin_package(
         LIBRARIES sfm_planner_core
         CATKIN_DEPENDS roscpp rospy std_msgs geometry_msgs nav_msgs sensor_msgs
                        visualization_msgs message_filters cv_bridge map_manager
-                       traj_utils tf quadrotor_msgs
+                       traj_utils tf quadrotor_msgs message_runtime
 )
 
 include_directories(
@@ -97,7 +118,24 @@ target_link_libraries(fsm_node
         ${THIRD_PARTY}
 )
 
-install(TARGETS fsm_node sfm_planner_core
+add_executable(inspection_mock_node Apps/inspection_mock_node.cpp)
+add_dependencies(inspection_mock_node
+        ${${PROJECT_NAME}_EXPORTED_TARGETS}
+        ${catkin_EXPORTED_TARGETS}
+)
+target_link_libraries(inspection_mock_node
+        ${catkin_LIBRARIES}
+)
+
+add_executable(state2state_topology_route_self_test
+        tests/state2state_topology_route_self_test.cpp
+)
+target_include_directories(state2state_topology_route_self_test PRIVATE
+        include
+        ${Eigen3_INCLUDE_DIRS}
+)
+
+install(TARGETS fsm_node sfm_planner_core inspection_mock_node
         ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
         LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}

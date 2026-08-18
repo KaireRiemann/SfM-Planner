@@ -1,5 +1,6 @@
 #pragma once
 
+#include <exception>
 #include <string>
 #include <utility>
 
@@ -72,12 +73,28 @@ private:
 
     StateToStateBackendResult dispatchBackend(const StateToStateRequest &request,
                                               const PlanInvocation invocation) const {
-        return StateToStateBackendRouter::makeLegacy(context_).run(
-                StateToStateBackendRequest{invocation,
-                                           request.goal,
-                                           request.goal_yaw,
-                                           request.new_goal,
-                                           request.plan_request.identity.backend});
+        try {
+            return StateToStateBackendRouter::makeLegacy(context_).run(
+                    StateToStateBackendRequest{invocation,
+                                               request.goal,
+                                               request.goal_yaw,
+                                               request.new_goal,
+                                               request.plan_request.identity.backend});
+        } catch (const std::exception &error) {
+            StateToStateBackendResult result;
+            result.backend = request.plan_request.identity.backend;
+            result.ret_code = general_utils::OPT_FAILED;
+            result.detail = std::string("state2state_exception:") + error.what();
+            context_.recordDiagnostic("ERROR", "state2state_backend_exception", result.detail);
+            return result;
+        } catch (...) {
+            StateToStateBackendResult result;
+            result.backend = request.plan_request.identity.backend;
+            result.ret_code = general_utils::OPT_FAILED;
+            result.detail = "state2state_unknown_exception";
+            context_.recordDiagnostic("ERROR", "state2state_backend_exception", result.detail);
+            return result;
+        }
     }
 
     bool projectOccupiedGoal(general_utils::Vec3f &goal) const {

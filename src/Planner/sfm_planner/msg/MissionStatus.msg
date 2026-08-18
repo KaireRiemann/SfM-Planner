@@ -1,0 +1,9 @@
+std_msgs/Header header
+string mission_id
+string state
+uint32 viewpoint_index
+uint32 viewpoint_count
+uint32 target_version
+bool has_pending_target
+string detail
+string failure_reason

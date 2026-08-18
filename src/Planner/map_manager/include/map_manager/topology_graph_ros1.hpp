@@ -16,7 +16,14 @@
 
 namespace general_planner {
 
-/** ROS1 timer adapter for incremental updates and RViz publication. */
+/**
+ * Asynchronous topology-maintenance adapter.
+ *
+ * ROS timers and map-fusion callbacks may request work, but the worker owns
+ * the actual update cadence.  This is important for the composed runtime:
+ * a busy ROS callback queue must never stop the world-lifetime topology from
+ * consuming already-fused map evidence.
+ */
 class TopologyGraphROS1 {
 public:
     using Ptr = std::shared_ptr<TopologyGraphROS1>;
@@ -28,6 +35,7 @@ public:
     ~TopologyGraphROS1();
 
     bool enabled() const { return enabled_; }
+    /** Thread-safe, coalesced request after a successful map fusion. */
     void updateAndPublish();
 
 private:
@@ -51,6 +59,7 @@ private:
     bool enabled_{false};
     double node_scale_{0.22};
     double edge_scale_{0.06};
+    double update_period_{0.20};
     double publish_period_{0.50};
     ros::WallTime last_publish_time_;
     std::size_t max_regions_per_tick_{4};

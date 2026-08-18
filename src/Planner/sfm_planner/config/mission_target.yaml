@@ -1,0 +1,17 @@
+scene_id: qingyuan_tunnel
+target_version: 0
+map_version: map_curved_face
+
+# Approach the curved end face (bulges toward free space along -Y).
+face_center: [80.5, 89.2, 1.5]
+face_normal: [0.0, -1.0, 0.0]
+nav_goal: [80.5, 86.2, 1.5]
+goal_yaw: 1.57079632679
+confidence: 0.9
+
+change_region:
+  center: [80.5, 89.2, 1.5]
+  normal: [0.0, -1.0, 0.0]
+  width: 7.2
+  height: 6.4
+  thickness: 1.2

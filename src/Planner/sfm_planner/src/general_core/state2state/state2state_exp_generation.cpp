@@ -127,6 +127,155 @@ namespace general_planner {
             return result.rejected();
         }
 
+        // For a rest-to-rest quintic p(u)=10u^3-15u^4+6u^5 over distance d,
+        // the exact peak factors are |v|=15d/(8T), |a|=10d/(sqrt(3)T^2),
+        // and |j|=60d/T^3.  The old close-goal seed used only d / max_vel,
+        // which can be a few tens of milliseconds for adjacent viewpoints and
+        // is therefore incompatible with a finite jerk bound.
+        double restToRestMinimumDuration(const double distance,
+                                         const double max_vel,
+                                         const double max_acc,
+                                         const double max_jerk) {
+            if (!std::isfinite(distance) || distance <= 1.0e-6 ||
+                !std::isfinite(max_vel) || !std::isfinite(max_acc) ||
+                !std::isfinite(max_jerk) ||
+                max_vel <= 0.0 || max_acc <= 0.0 || max_jerk <= 0.0) {
+                return 0.0;
+            }
+            constexpr double kVelocityFactor = 15.0 / 8.0;
+            constexpr double kAccelerationFactor = 10.0 / 1.7320508075688772;
+            constexpr double kJerkFactor = 60.0;
+            constexpr double kSeedMargin = 1.05;
+            return kSeedMargin * std::max({
+                    kVelocityFactor * distance / max_vel,
+                    std::sqrt(kAccelerationFactor * distance / max_acc),
+                    std::cbrt(kJerkFactor * distance / max_jerk)});
+        }
+
+        // Preserve guide geometry and all relative knot locations while making
+        // a from-rest guide dynamically meaningful.  This covers both the
+        // direct close-goal append and the short A* guide path.
+        double enforceRestGuideDuration(const vec_Vec3f &guide_path,
+                                        std::vector<double> &guide_stamp,
+                                        const double max_vel,
+                                        const double max_acc,
+                                        const double max_jerk) {
+            if (guide_path.size() < 2 || guide_path.size() != guide_stamp.size()) {
+                return 1.0;
+            }
+            const double current_duration = guide_stamp.back() - guide_stamp.front();
+            const double required_duration = restToRestMinimumDuration(
+                    geometry_utils::computePathLength(guide_path), max_vel, max_acc, max_jerk);
+            if (!std::isfinite(current_duration) || current_duration <= 0.0 ||
+                !std::isfinite(required_duration) || required_duration <= current_duration) {
+                return 1.0;
+            }
+            const double scale = required_duration / current_duration;
+            const double first_stamp = guide_stamp.front();
+            for (double &stamp : guide_stamp) {
+                stamp = first_stamp + (stamp - first_stamp) * scale;
+            }
+            return scale;
+        }
+
+        struct TrajectoryDerivativePeak {
+            double velocity{0.0};
+            double acceleration{0.0};
+            double jerk{0.0};
+        };
+
+        bool sampleTrajectoryDerivativePeak(const Trajectory &traj,
+                                            TrajectoryDerivativePeak &peak) {
+            if (traj.empty()) {
+                return false;
+            }
+            constexpr double kSampleDt = 0.005;
+            constexpr int kMaxSamplesPerPiece = 400;
+            peak = TrajectoryDerivativePeak{};
+            for (int piece_id = 0; piece_id < traj.getPieceNum(); ++piece_id) {
+                const auto &piece = traj[piece_id];
+                const double duration = piece.getDuration();
+                if (!std::isfinite(duration) || duration <= 0.0) {
+                    return false;
+                }
+                const int samples = std::clamp(
+                        static_cast<int>(std::ceil(duration / kSampleDt)), 1, kMaxSamplesPerPiece);
+                for (int sample_id = 0; sample_id <= samples; ++sample_id) {
+                    const double t = duration * static_cast<double>(sample_id) /
+                                     static_cast<double>(samples);
+                    const Vec3f velocity = piece.getVel(t);
+                    const Vec3f acceleration = piece.getAcc(t);
+                    const Vec3f jerk = piece.getJer(t);
+                    if (!velocity.allFinite() || !acceleration.allFinite() || !jerk.allFinite()) {
+                        return false;
+                    }
+                    peak.velocity = std::max(peak.velocity, velocity.norm());
+                    peak.acceleration = std::max(peak.acceleration, acceleration.norm());
+                    peak.jerk = std::max(peak.jerk, jerk.norm());
+                }
+            }
+            return true;
+        }
+
+        // p_scaled(t) = p(t / scale) keeps the entire spatial curve and its
+        // endpoints unchanged while reducing v/a/j by scale^-1/-2/-3.  It is
+        // safe for a PlanFromRest goal-connected trajectory because both
+        // endpoint derivatives are constrained to zero; do not use it across
+        // a running trajectory splice where derivative continuity is required.
+        bool rescaleTrajectoryTime(Trajectory &traj, const double scale) {
+            if (traj.empty() || !std::isfinite(scale) || scale < 1.0) {
+                return false;
+            }
+            Trajectory retimed;
+            retimed.reserve(traj.getPieceNum());
+            for (int piece_id = 0; piece_id < traj.getPieceNum(); ++piece_id) {
+                const auto &piece = traj[piece_id];
+                const double duration = piece.getDuration();
+                Eigen::MatrixXd coefficients = piece.getCoeffMat();
+                if (!std::isfinite(duration) || duration <= 0.0 || !coefficients.allFinite()) {
+                    return false;
+                }
+                const int degree = piece.getDegree();
+                for (int col = 0; col < coefficients.cols(); ++col) {
+                    const int power = degree - col;
+                    coefficients.col(col) /= std::pow(scale, power);
+                }
+                retimed.emplace_back(duration * scale, coefficients);
+            }
+            retimed.start_WT = traj.start_WT;
+            traj = retimed;
+            return true;
+        }
+
+        bool retimeRestGoalTrajectoryToDynamics(Trajectory &traj,
+                                                const double max_vel,
+                                                const double max_acc,
+                                                const double max_jerk,
+                                                double &scale,
+                                                TrajectoryDerivativePeak &before_peak) {
+            scale = 1.0;
+            if (!sampleTrajectoryDerivativePeak(traj, before_peak) ||
+                !std::isfinite(max_vel) || !std::isfinite(max_acc) || !std::isfinite(max_jerk) ||
+                max_vel <= 0.0 || max_acc <= 0.0 || max_jerk <= 0.0) {
+                return false;
+            }
+            // Leave a small margin below the configured limits: the output
+            // checker samples at 20 ms and accepts 1.35x, but the command sent
+            // to the vehicle should target the actual configured bounds.
+            constexpr double kTargetRatio = 0.95;
+            constexpr double kRetimeMargin = 1.02;
+            scale = std::max({1.0,
+                              before_peak.velocity / (kTargetRatio * max_vel),
+                              std::sqrt(before_peak.acceleration / (kTargetRatio * max_acc)),
+                              std::cbrt(before_peak.jerk / (kTargetRatio * max_jerk))});
+            if (scale <= 1.0 + 1.0e-3) {
+                scale = 1.0;
+                return true;
+            }
+            scale *= kRetimeMargin;
+            return rescaleTrajectoryTime(traj, scale);
+        }
+
         bool currentTrajectorySafeForNoNeed(state2state_task::StateToStateExpBackendServices &services,
                                             const Trajectory &traj,
                                             const double start_t) {
@@ -207,6 +356,18 @@ namespace general_planner {
         const bool use_plain_exp_traj = services.cfg.plain_traj_en;
         const bool use_esdf_exp_traj = services.cfg.esdf_traj_en && !use_plain_exp_traj;
         const bool use_distance_field_exp_traj = use_plain_exp_traj || use_esdf_exp_traj;
+        const auto capped_motion_limit = [](const double configured,
+                                            const double override_limit) {
+            return std::isfinite(override_limit) && override_limit > 0.0
+                   ? std::min(configured, override_limit)
+                   : configured;
+        };
+        const double plan_max_vel = capped_motion_limit(
+                services.cfg.exp_traj_cfg.max_vel, services.motion_limits.max_vel);
+        const double plan_max_acc = capped_motion_limit(
+                services.cfg.exp_traj_cfg.max_acc, services.motion_limits.max_acc);
+        const double plan_max_jerk = capped_motion_limit(
+                services.cfg.exp_traj_cfg.max_jerk, services.motion_limits.max_jerk);
         const bool reuse_command_guide_prefix =
                 !planning_from_rest && services.cfg.state2state_replan_use_command_guide;
 
@@ -417,7 +578,7 @@ namespace general_planner {
         if (temp_horizon > services.cfg.resolution * 2) {
             if ((guide_path.back() - services.goal_p).norm() < services.cfg.resolution * 5) {
                 guide_stamp.push_back(guide_stamp.back() +
-                                      (guide_path.back() - services.goal_p).norm() / services.cfg.exp_traj_cfg.max_vel);
+                                      (guide_path.back() - services.goal_p).norm() / plan_max_vel);
                 guide_path.push_back(services.goal_p);
             } else {
                 vec_Vec3f new_path;
@@ -445,8 +606,8 @@ namespace general_planner {
                     double last_stamp = 0;
                     for (int i = dis.size() - 1; i >= 0; i--) {
                         double vel;
-                        if (!geometry_utils::simplePMTimeAllocator(services.cfg.exp_traj_cfg.max_acc,
-                                                                   services.cfg.exp_traj_cfg.max_vel,
+                        if (!geometry_utils::simplePMTimeAllocator(plan_max_acc,
+                                                                   plan_max_vel,
                                                                    guide_path_end_vel,
                                                                    total_dis,
                                                                    dis[i],
@@ -456,8 +617,8 @@ namespace general_planner {
                                            total_dis,
                                            dis[i],
                                            guide_path_end_vel,
-                                           services.cfg.exp_traj_cfg.max_vel,
-                                           services.cfg.exp_traj_cfg.max_acc);
+                                           plan_max_vel,
+                                           plan_max_acc);
                             return FAILED;
                         }
                         const double stamp_dt = stamps[i] - last_stamp;
@@ -490,6 +651,20 @@ namespace general_planner {
         }
 
         const bool connected_goal = (guide_path.back().head(2) - services.goal_p.head(2)).norm() < services.cfg.resolution * 2;
+        if (planning_from_rest && connected_goal) {
+            const double guide_scale = enforceRestGuideDuration(
+                    guide_path,
+                    guide_stamp,
+                    plan_max_vel,
+                    plan_max_acc,
+                    plan_max_jerk);
+            if (guide_scale > 1.0 + 1.0e-3) {
+                services.ros_ptr->info(
+                        " -- [GeneralPlanner] Rest-to-goal guide retimed for dynamics: scale={:.3f}, duration={:.3f}s.",
+                        guide_scale,
+                        guide_stamp.back() - guide_stamp.front());
+            }
+        }
         out_exp_traj_info.setGoalConnectedFlag(connected_goal);
 
         if (rejectOnCheckFailure(services.ros_ptr,
@@ -536,7 +711,7 @@ namespace general_planner {
         const bool local_endpoint_is_global_goal =
                 (pos_fina_state.col(0) - services.goal_p).norm() < services.cfg.resolution * 2;
         if (services.cfg.goal_vel_en && (services.goal_p - services.robot_state.p).norm() > services.cfg.planning_horizon / 2) {
-            pos_fina_state.col(1) = (services.goal_p - services.robot_state.p).normalized() * services.cfg.exp_traj_cfg.max_vel / 2;
+            pos_fina_state.col(1) = (services.goal_p - services.robot_state.p).normalized() * plan_max_vel / 2;
         }
         if (local_endpoint_is_global_goal) {
             pos_fina_state.col(0) = services.goal_p;
@@ -661,13 +836,6 @@ namespace general_planner {
                                                       out_traj);
         }
         services.time_consuming[EXP_TRAJ_OPT] = t_exp_opt.stop();
-        copyZSummary(summarizeTrajectoryZ(out_traj, services.cfg.sample_traj_dt),
-                     services.z_debug.optimized);
-        if (services.z_debug.optimized.valid) {
-            services.z_debug.opt_end_local_target_z_err =
-                    services.z_debug.optimized.end -
-                    services.z_debug.local_target_z;
-        }
         if (use_esdf_exp_traj) {
             VecDf init_ts;
             vec_Vec3f init_ps;
@@ -687,6 +855,34 @@ namespace general_planner {
         if (!temp_ret) {
             services.ros_ptr->warn(" -- [GeneralPlanner] OptimizationExpTraj for new path failed");
             return FAILED;
+        }
+        if (planning_from_rest && local_endpoint_is_global_goal) {
+            double retime_scale = 1.0;
+            TrajectoryDerivativePeak before_peak;
+            if (!retimeRestGoalTrajectoryToDynamics(out_traj,
+                                                    plan_max_vel,
+                                                    plan_max_acc,
+                                                    plan_max_jerk,
+                                                    retime_scale,
+                                                    before_peak)) {
+                services.ros_ptr->warn(" -- [GeneralPlanner] Unable to evaluate rest-to-goal trajectory dynamics for retiming.");
+                return FAILED;
+            }
+            if (retime_scale > 1.0 + 1.0e-3) {
+                services.ros_ptr->warn(
+                        " -- [GeneralPlanner] Rest-to-goal trajectory retimed for dynamics: scale={:.3f}, peak(v/a/j)=({:.3f}/{:.3f}/{:.3f}).",
+                        retime_scale,
+                        before_peak.velocity,
+                        before_peak.acceleration,
+                        before_peak.jerk);
+            }
+        }
+        copyZSummary(summarizeTrajectoryZ(out_traj, services.cfg.sample_traj_dt),
+                     services.z_debug.optimized);
+        if (services.z_debug.optimized.valid) {
+            services.z_debug.opt_end_local_target_z_err =
+                    services.z_debug.optimized.end -
+                    services.z_debug.local_target_z;
         }
         if (services.z_debug.optimized.valid && std::isfinite(z_floor_reference)) {
             services.z_debug.z_floor_min_margin = services.z_debug.optimized.min -

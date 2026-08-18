@@ -295,6 +295,82 @@ void ProbMap::updateOccPointCloud(const PointCloud& input_cloud) {
     map_empty_ = false;
 }
 
+int ProbMap::forceUnknownInOrientedBox(const Vec3f &center,
+                                       const Vec3f &normal,
+                                       const double width,
+                                       const double height,
+                                       const double thickness) {
+    if (width <= 0.0 || height <= 0.0 || thickness <= 0.0 || !normal.allFinite() ||
+        !center.allFinite() || normal.norm() < 1e-6) {
+        return 0;
+    }
+
+    Vec3f n = normal.normalized();
+    Vec3f up = Vec3f::UnitZ();
+    if (std::abs(n.dot(up)) > 0.95) {
+        up = Vec3f::UnitY();
+    }
+    const Vec3f u = (up.cross(n)).normalized();
+    const Vec3f v = n.cross(u);
+    const double half_w = 0.5 * width;
+    const double half_h = 0.5 * height;
+    const double half_t = 0.5 * thickness;
+
+    // Conservative AABB for iteration.
+    Vec3f corners[8];
+    int ci = 0;
+    for (const double su : {-1.0, 1.0}) {
+        for (const double sv : {-1.0, 1.0}) {
+            for (const double sn : {-1.0, 1.0}) {
+                corners[ci++] =
+                        center + su * half_w * u + sv * half_h * v + sn * half_t * n;
+            }
+        }
+    }
+    Vec3f box_min = corners[0];
+    Vec3f box_max = corners[0];
+    for (int i = 1; i < 8; ++i) {
+        box_min = box_min.cwiseMin(corners[i]);
+        box_max = box_max.cwiseMax(corners[i]);
+    }
+    boundBoxByLocalMap(box_min, box_max);
+
+    Vec3i id_min, id_max;
+    posToGlobalIndex(box_min, id_min);
+    posToGlobalIndex(box_max, id_max);
+    int cleared = 0;
+    for (int x = id_min.x(); x <= id_max.x(); ++x) {
+        for (int y = id_min.y(); y <= id_max.y(); ++y) {
+            for (int z = id_min.z(); z <= id_max.z(); ++z) {
+                const Vec3i id_g(x, y, z);
+                if (!insideLocalMap(id_g)) {
+                    continue;
+                }
+                Vec3f pos;
+                globalIndexToPos(id_g, pos);
+                const Vec3f d = pos - center;
+                if (std::abs(d.dot(u)) > half_w || std::abs(d.dot(v)) > half_h ||
+                    std::abs(d.dot(n)) > half_t) {
+                    continue;
+                }
+                if (!isOccupied(pos) && !isKnownFree(pos)) {
+                    continue;
+                }
+                const int hash_id = getHashIndexFromGlobalIndex(id_g);
+                resetCell(hash_id);
+                ++cleared;
+            }
+        }
+    }
+    if (cleared > 0) {
+        if (cfg_.esdf_en && esdf_map_) {
+            esdf_map_->updateESDF3D(center);
+        }
+        notifyStateChangeCallback();
+    }
+    return cleared;
+}
+
 void ProbMap::slideAllMap(const rog_map::Vec3f& pos) {
     mapSliding(pos);
     inf_map_->mapSliding(pos);

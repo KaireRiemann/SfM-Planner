@@ -42,6 +42,7 @@
 #include <general_core/planner_context.hpp>
 #include <general_core/safety_monitor.hpp>
 #include <general_core/task_plugin.hpp>
+#include <mission/inspection_mission_planner.hpp>
 
 
 #ifndef LOG_FILE_DIR
@@ -215,10 +216,32 @@ namespace fsm {
         std::unique_ptr<TaskExecutor> task_executor_;
         TaskMode task_executor_mode_{TaskMode::STATE_TO_STATE};
 
+        std::unique_ptr<mission::InspectionMissionPlanner> inspection_mission_;
+        mission::NavigationRole active_navigation_role_{
+                mission::NavigationRole::EXTERNAL_CLICK};
+        bool mission_goal_submission_{false};
+        bool inspection_auto_start_pending_{false};
+        std::uint64_t inspection_nav_epoch_{0};
+
+        void applyInspectionTopologyPolicy(mission::NavigationRole role);
+        void applyInspectionMotionProfile(mission::NavigationRole role);
 
     public:
         Fsm() = default;
         ~Fsm();
+
+        bool inspectionMissionActive() const;
+
+        bool startInspectionMission(const mission::MissionPose *approach_override = nullptr);
+
+        bool submitMissionNavigationGoal(const mission::MissionPose &goal,
+                                         mission::NavigationRole role);
+
+        void onFaceObservation(const mission::FaceObservation &observation);
+
+        void onCaptureResult(const mission::CaptureResult &result);
+
+        void cancelInspectionMission(const std::string &reason = "cancelled");
 
         void updateROGMap(const rog_map::PointCloud &cloud, const general_utils::Pose &pose) {
             planner_ptr_->updateROGMap(cloud, pose);
@@ -282,6 +305,8 @@ namespace fsm {
         uint64_t next_replan_id_{1};
         uint64_t active_replan_id_{0};
         int state2state_plan_from_rest_fail_count_{0};
+        double state2state_plan_from_rest_fail_start_time_{-1.0};
+        double state2state_plan_from_rest_retry_after_{-1.0};
         int exploration_plan_from_rest_fail_count_{0};
         int tracking_plan_from_rest_fail_count_{0};
         double tracking_plan_from_rest_backoff_until_{-1.0};
@@ -356,6 +381,8 @@ namespace fsm {
         void callReplanOnce();
 
         void callPerceptionSafetyCheckOnce();
+
+        void resetState2StatePlanFromRestFailure();
 
         void callMainFsmOnce();
 
@@ -457,5 +484,13 @@ namespace fsm {
         virtual void publishCurPoseToPath() = 0;
 
         virtual void resetVisualizedPath() = 0;
+
+        virtual void publishFaceDetectionRequest(const mission::FaceDetectionRequest &) {}
+
+        virtual void publishCaptureRequest(const mission::CaptureCommand &) {}
+
+        virtual void publishMissionStatus(const mission::MissionStatusInfo &) {}
+
+        void initInspectionMissionPlanner();
     };
 }

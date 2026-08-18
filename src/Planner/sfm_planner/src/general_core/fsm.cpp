@@ -23,6 +23,9 @@
 
 #include <fsm/fsm.h>
 #include <checker/common_checker.hpp>
+#include <mission/change_region_mask.hpp>
+#include <mission/mission_target_store.hpp>
+#include <utils/geometry/geometry_utils.h>
 #include <algorithm>
 #include <boost/filesystem.hpp>
 #include <cmath>
@@ -962,6 +965,38 @@ namespace fsm {
         static double last_print_t = 0.0;
         planner_ptr_->getRobotState(robot_state_);
 
+        // Build a conservative return corridor from motion the vehicle has
+        // actually executed.  The planner performs the inflated known-free
+        // validation before accepting a breadcrumb; never feed merely planned
+        // points here.  Capture legs are included because the final viewpoint
+        // can be farther from the approach point than the blast-face goal.
+        if (inspectionMissionActive() &&
+            active_navigation_role_ != mission::NavigationRole::HOME &&
+            robot_state_.rcv && robot_state_.p.allFinite() &&
+            (ros_ptr_->getSimTime() - robot_state_.rcv_time) <= 0.2) {
+            planner_ptr_->observeState2StateReturnBreadcrumb(robot_state_.p);
+        }
+
+        // The inspection launch profile can be fully self-starting, but home
+        // must be captured from a real, fresh odometry sample rather than the
+        // default-initialized robot state at node construction.
+        if (inspection_auto_start_pending_ &&
+            robot_state_.rcv &&
+            (ros_ptr_->getSimTime() - robot_state_.rcv_time) <= 0.2) {
+            inspection_auto_start_pending_ = false;
+            const bool accepted = startInspectionMission();
+            recordDiagnosticEvent(accepted ? "INFO" : "ERROR",
+                                  "inspection_auto_start",
+                                  accepted ? "accepted" : "rejected");
+            if (!accepted) {
+                ros_ptr_->warn(" -- [Inspection] Auto start rejected; use {} after fixing the mission target/config.",
+                               cfg_.inspection_mission.start_service);
+            }
+        }
+        if (inspection_mission_) {
+            inspection_mission_->tick();
+        }
+
 
         if (cur_t - last_print_t > 1.0) {
             last_print_t = cur_t;
@@ -1006,6 +1041,14 @@ namespace fsm {
                     state2state_replan_in_progress_.load()) {
                     return;
                 }
+                const bool inspection_navigation_active =
+                        inspectionMissionActive() &&
+                        active_navigation_role_ != mission::NavigationRole::EXTERNAL_CLICK;
+                if (inspection_navigation_active &&
+                    state2state_plan_from_rest_retry_after_ > 0.0 &&
+                    ros_ptr_->getSimTime() < state2state_plan_from_rest_retry_after_) {
+                    return;
+                }
                 active_replan_id_ = next_replan_id_++;
                 TaskExecutor &executor = taskExecutor();
                 if (executor.goalLike() && closeToGoal(0.1)) {
@@ -1019,7 +1062,7 @@ namespace fsm {
                                           0);
                     ChangeState("MainFsmCallback", WAIT_GOAL);
                     gi_.new_goal = false;
-                    state2state_plan_from_rest_fail_count_ = 0;
+                    resetState2StatePlanFromRestFailure();
                     finish_plan = true;
                     return;
                 }
@@ -1039,7 +1082,22 @@ namespace fsm {
                 plan_request.phase = executionPhase();
                 plan_request.new_goal = gi_.new_goal;
                 plan_request.new_task = task_new_;
-                PlanResult plan_result = executor.plan(*this, plan_request);
+                PlanResult plan_result;
+                try {
+                    plan_result = executor.plan(*this, plan_request);
+                } catch (const std::exception &error) {
+                    plan_result.request = plan_request;
+                    plan_result.ret_code = OPT_FAILED;
+                    plan_result.detail = std::string("task_executor_exception:") + error.what();
+                    recordDiagnosticEvent("ERROR", "plan_from_rest_exception",
+                                          plan_result.detail, OPT_FAILED);
+                } catch (...) {
+                    plan_result.request = plan_request;
+                    plan_result.ret_code = OPT_FAILED;
+                    plan_result.detail = "task_executor_unknown_exception";
+                    recordDiagnosticEvent("ERROR", "plan_from_rest_exception",
+                                          plan_result.detail, OPT_FAILED);
+                }
                 const TaskPlanContext &plan_context = plan_result.context;
                 const int retcode = plan_result.ret_code;
                 if (plan_context.missing_input || plan_context.handled) {
@@ -1056,7 +1114,7 @@ namespace fsm {
                                           retcode);
                     gi_.new_goal = false;
                     started_ = false;
-                    state2state_plan_from_rest_fail_count_ = 0;
+                    resetState2StatePlanFromRestFailure();
                     ChangeState("MainFsmCallback", WAIT_GOAL);
                     return;
                 }
@@ -1132,7 +1190,7 @@ namespace fsm {
                         if (explorationMode()) {
                             exploration_plan_from_rest_fail_count_ = 0;
                         } else if (executor.goalLike()) {
-                            state2state_plan_from_rest_fail_count_ = 0;
+                            resetState2StatePlanFromRestFailure();
                         } else if (executor.trackingLike()) {
                             resetTrackingPlanFromRestFailureState();
                         }
@@ -1154,7 +1212,7 @@ namespace fsm {
                         started_ = false;
                         plan_from_rest_ = false;
                         finish_plan = true;
-                        state2state_plan_from_rest_fail_count_ = 0;
+                        resetState2StatePlanFromRestFailure();
                         ChangeState("MainFsmCallback", WAIT_GOAL);
                         break;
                     case general_planner::architecture::CommitAction::RETRY_PLANNING:
@@ -1181,29 +1239,100 @@ namespace fsm {
                         } else if (executor.goalLike()) {
                             ++state2state_plan_from_rest_fail_count_;
                             const int failure_limit = cfg_.state2state_plan_from_rest_max_failures;
+                            const bool inspection_navigation_failed =
+                                    inspection_mission_ && inspection_mission_->active() &&
+                                    active_navigation_role_ != mission::NavigationRole::EXTERNAL_CLICK;
+                            const double now = ros_ptr_->getSimTime();
+                            if (state2state_plan_from_rest_fail_count_ == 1) {
+                                state2state_plan_from_rest_fail_start_time_ = now;
+                            }
+                            double retry_delay = 0.0;
+                            if (inspection_navigation_failed) {
+                                // Replanning the identical short capture leg at the FSM
+                                // rate only repeats the same numerical line-search failure.
+                                // Let map/corridor updates arrive between attempts, with a
+                                // bounded exponential backoff that cannot starve recovery.
+                                const double retry_initial = std::max(
+                                        0.01,
+                                        cfg_.state2state_inspection_retry_backoff_initial_sec);
+                                const double retry_max = std::max(
+                                        retry_initial,
+                                        cfg_.state2state_inspection_retry_backoff_max_sec);
+                                const int exponent = std::min(
+                                        4,
+                                        std::max(0,
+                                                 (state2state_plan_from_rest_fail_count_ - 1) / 2));
+                                retry_delay = std::min(
+                                        retry_max,
+                                        retry_initial * std::pow(2.0, exponent));
+                                state2state_plan_from_rest_retry_after_ = now + retry_delay;
+                            }
+                            double inspection_time_limit =
+                                    cfg_.state2state_plan_from_rest_max_failure_sec;
+                            if (inspection_navigation_failed &&
+                                active_navigation_role_ ==
+                                        mission::NavigationRole::CAPTURE_VIEWPOINT &&
+                                cfg_.state2state_inspection_capture_max_failure_sec > 0.0) {
+                                inspection_time_limit =
+                                        cfg_.state2state_inspection_capture_max_failure_sec;
+                            }
+                            if (inspection_navigation_failed && inspection_time_limit <= 0.0) {
+                                // GENERATE_TRAJ is 100 Hz; never use a raw attempt
+                                // count as the inspection abort budget.
+                                inspection_time_limit = 20.0;
+                            }
+                            const double inspection_elapsed =
+                                    state2state_plan_from_rest_fail_start_time_ > 0.0
+                                        ? now - state2state_plan_from_rest_fail_start_time_
+                                        : 0.0;
                             cout << YELLOW << " -- [Fsm] PlanFromRest failed, try replan. consecutive_failures="
                                  << state2state_plan_from_rest_fail_count_;
-                            if (failure_limit > 0) {
+                            if (inspection_navigation_failed) {
+                                cout << " elapsed=" << inspection_elapsed << "s/"
+                                     << inspection_time_limit << "s"
+                                     << " retry_after=" << retry_delay << "s";
+                            } else if (failure_limit > 0) {
                                 cout << "/" << failure_limit;
                             }
                             cout << RESET << endl;
                             recordDiagnosticEvent("WARN",
                                                   "plan_from_rest_consecutive_failure",
-                                                  fmt::format("count={};limit={};clear_goal_on_limit={}",
+                                                  fmt::format("count={};limit={};elapsed={:.2f};time_limit={:.2f};clear_goal_on_limit={}",
                                                               state2state_plan_from_rest_fail_count_,
                                                               failure_limit,
+                                                              inspection_elapsed,
+                                                              inspection_time_limit,
                                                               static_cast<int>(
                                                                       cfg_.state2state_clear_goal_on_plan_failure)),
                                                   retcode);
-                            if (failure_limit > 0 &&
-                                state2state_plan_from_rest_fail_count_ >= failure_limit) {
+                            const bool inspection_time_exceeded =
+                                    inspection_navigation_failed &&
+                                    inspection_time_limit > 0.0 &&
+                                    inspection_elapsed >= inspection_time_limit;
+                            const bool click_count_exceeded =
+                                    !inspection_navigation_failed &&
+                                    failure_limit > 0 &&
+                                    state2state_plan_from_rest_fail_count_ >= failure_limit;
+                            if (inspection_time_exceeded || click_count_exceeded) {
                                 recordDiagnosticEvent("ERROR",
                                                       "plan_from_rest_failure_limit_reached",
-                                                      fmt::format("count={};clear_goal={}",
+                                                      fmt::format("count={};elapsed={:.2f};clear_goal={}",
                                                                   state2state_plan_from_rest_fail_count_,
+                                                                  inspection_elapsed,
                                                                   static_cast<int>(
                                                                           cfg_.state2state_clear_goal_on_plan_failure)),
                                                       retcode);
+                                if (inspection_navigation_failed) {
+                                    inspection_mission_->onNavigationFailed(
+                                            active_navigation_role_,
+                                            fmt::format("navigation_plan_failed:{}",
+                                                        retCodeName(retcode)));
+                                    // The mission owns the failure transition:
+                                    // non-home legs return home, while a failed
+                                    // home leg becomes terminal.
+                                    resetState2StatePlanFromRestFailure();
+                                    break;
+                                }
                                 if (cfg_.state2state_clear_goal_on_plan_failure) {
                                     cout << YELLOW << " -- [Fsm] PlanFromRest failed "
                                          << state2state_plan_from_rest_fail_count_
@@ -1215,7 +1344,7 @@ namespace fsm {
                                     finish_plan = true;
                                     ChangeState("PlanFromRestFailureLimit", WAIT_GOAL);
                                 }
-                                state2state_plan_from_rest_fail_count_ = 0;
+                                resetState2StatePlanFromRestFailure();
                             }
                         } else if (executor.trackingLike()) {
                             handleTrackingPlanFromRestFailure(retcode,
@@ -1262,12 +1391,202 @@ namespace fsm {
         }
     }
 
+    void Fsm::resetState2StatePlanFromRestFailure() {
+        state2state_plan_from_rest_fail_count_ = 0;
+        state2state_plan_from_rest_fail_start_time_ = -1.0;
+        state2state_plan_from_rest_retry_after_ = -1.0;
+    }
+
     bool Fsm::closeToGoal(const double &thresh_dis) {
         /// The close to goal should consider the the local shift
         /// All goal should be in the known free on inf map.
         /// The intermedia points should be in free space.
         double dis = (robot_state_.p - gi_.goal_p).norm();
-        return dis < thresh_dis;
+        if (dis >= thresh_dis) {
+            return false;
+        }
+
+        // A mission transition must not be driven by a position-only arrival:
+        // every approach and coverage pose has a camera/vehicle viewing yaw.
+        // Keep generic state2state goals position-only, while an inspection
+        // leg replans a yaw-only settling trajectory when needed.
+        if (inspectionMissionActive() &&
+            active_navigation_role_ != mission::NavigationRole::EXTERNAL_CLICK &&
+            std::isfinite(gi_.goal_yaw) && robot_state_.q.coeffs().allFinite()) {
+            const double current_yaw = geometry_utils::get_yaw_from_quaternion(robot_state_.q);
+            const double yaw_tolerance = std::max(
+                    0.0, cfg_.inspection_mission.arrival_yaw_tolerance_rad);
+            return std::abs(yawDiff(current_yaw, gi_.goal_yaw)) < yaw_tolerance;
+        }
+        return true;
+    }
+
+    bool Fsm::inspectionMissionActive() const {
+        return inspection_mission_ && inspection_mission_->active();
+    }
+
+    void Fsm::initInspectionMissionPlanner() {
+        if (!cfg_.inspection_mission.enable) {
+            return;
+        }
+
+        std::string target_path = cfg_.inspection_mission.target_file;
+        if (!target_path.empty() && target_path.front() != '/') {
+            target_path = std::string(ROOT_DIR) + target_path;
+        }
+        auto store = std::make_shared<mission::MissionTargetStore>(target_path);
+        inspection_mission_ = std::make_unique<mission::InspectionMissionPlanner>(
+                cfg_.inspection_mission, store);
+        inspection_auto_start_pending_ = cfg_.inspection_mission.auto_start;
+
+        inspection_mission_->setCallbacks(
+                [this](const mission::MissionPose &goal, mission::NavigationRole role) {
+                    return submitMissionNavigationGoal(goal, role);
+                },
+                [this](const mission::FaceDetectionRequest &request) {
+                    publishFaceDetectionRequest(request);
+                },
+                [this](const mission::CaptureCommand &request) {
+                    publishCaptureRequest(request);
+                },
+                [this](const mission::MissionStatusInfo &status) { publishMissionStatus(status); },
+                [this]() {
+                    return planner_ptr_ ? planner_ptr_->getMapManager()
+                                        : general_planner::MapManager::Ptr{};
+                });
+
+        if (cfg_.inspection_mission.apply_change_region_mask && store->exists() &&
+            planner_ptr_) {
+            mission::MissionTarget target;
+            if (store->load(target) && target.previous_face_region.valid) {
+                const int cleared = mission::applyChangeRegionMask(
+                        planner_ptr_->getMapManager(), target.previous_face_region);
+                fmt::print(fg(fmt::color::yellow),
+                           " -- [Inspection] Masked prior face region, cleared {} cells.\n",
+                           cleared);
+            }
+        }
+        fmt::print(fg(fmt::color::yellow),
+                   " -- [Inspection] Mission planner enabled, target file: {}\n",
+                   target_path);
+    }
+
+    bool Fsm::submitMissionNavigationGoal(const mission::MissionPose &goal,
+                                          mission::NavigationRole role) {
+        if (!goal.position.allFinite()) {
+            return false;
+        }
+        active_navigation_role_ = role;
+        applyInspectionMotionProfile(role);
+        applyInspectionTopologyPolicy(role);
+        mission_goal_submission_ = true;
+        const Quatf q = geometry_utils::yaw_to_quaternion(goal.yaw);
+        setGoalPosiAndYaw(Vec3f(goal.position.x(), goal.position.y(), goal.position.z()),
+                          q,
+                          GoalHeightMode::MESSAGE_HEIGHT);
+        mission_goal_submission_ = false;
+
+        if (gi_.new_goal) {
+            return true;
+        }
+        // Already at the goal: advance the mission immediately.
+        if (closeToGoal(0.15) && inspection_mission_) {
+            mission::MissionPose robot;
+            robot.position = Eigen::Vector3d(robot_state_.p.x(), robot_state_.p.y(),
+                                             robot_state_.p.z());
+            robot.yaw = robot_state_.q.coeffs().allFinite()
+                                ? geometry_utils::get_yaw_from_quaternion(robot_state_.q)
+                                : goal.yaw;
+            inspection_mission_->onNavigationSucceeded(role, robot);
+            return true;
+        }
+        return false;
+    }
+
+    bool Fsm::startInspectionMission(const mission::MissionPose *approach_override) {
+        if (!cfg_.inspection_mission.enable || !inspection_mission_) {
+            return false;
+        }
+        if (inspection_mission_->active()) {
+            return false;
+        }
+        if (planner_ptr_) {
+            planner_ptr_->getRobotState(robot_state_);
+        }
+        if (!robot_state_.rcv ||
+            (ros_ptr_->getSimTime() - robot_state_.rcv_time) > 0.2 ||
+            !robot_state_.p.allFinite()) {
+            return false;
+        }
+        mission::MissionPose home;
+        home.position = Eigen::Vector3d(robot_state_.p.x(), robot_state_.p.y(),
+                                        robot_state_.p.z());
+        home.yaw = robot_state_.q.coeffs().allFinite()
+                           ? geometry_utils::get_yaw_from_quaternion(robot_state_.q)
+                           : 0.0;
+        active_navigation_role_ = mission::NavigationRole::APPROACH_TARGET;
+        const bool accepted = inspection_mission_->start(home, "", approach_override);
+        if (accepted && planner_ptr_) {
+            // The mission planner has captured exactly this pose as home.
+            // Resetting here prevents a completed/aborted prior mission from
+            // ever contributing a stale route to the next return-home leg.
+            planner_ptr_->beginState2StateReturnBreadcrumb(
+                    Vec3f(home.position.x(), home.position.y(), home.position.z()));
+        }
+        return accepted;
+    }
+
+    void Fsm::onFaceObservation(const mission::FaceObservation &observation) {
+        if (inspection_mission_) {
+            inspection_mission_->onFaceObservation(observation);
+        }
+    }
+
+    void Fsm::onCaptureResult(const mission::CaptureResult &result) {
+        if (inspection_mission_) {
+            inspection_mission_->onCaptureResult(result);
+        }
+    }
+
+    void Fsm::applyInspectionTopologyPolicy(mission::NavigationRole role) {
+        if (planner_ptr_ == nullptr) {
+            return;
+        }
+        const bool enable_topology_guidance =
+                role == mission::NavigationRole::HOME;
+        planner_ptr_->setState2StateTopologyPolicy(enable_topology_guidance);
+        planner_ptr_->setState2StateTopologyTaskEpoch(++inspection_nav_epoch_);
+        if (enable_topology_guidance) {
+            fmt::print(fg(fmt::color::cyan),
+                       " -- [Inspection] {} uses global topology A* then local replan.\n",
+                       mission::toString(role));
+        }
+    }
+
+    void Fsm::applyInspectionMotionProfile(mission::NavigationRole role) {
+        if (planner_ptr_ == nullptr) {
+            return;
+        }
+        if (role != mission::NavigationRole::CAPTURE_VIEWPOINT) {
+            planner_ptr_->setState2StateMotionLimits(0.0, 0.0, 0.0);
+            return;
+        }
+        planner_ptr_->setState2StateMotionLimits(
+                cfg_.state2state_inspection_capture_max_vel,
+                cfg_.state2state_inspection_capture_max_acc,
+                cfg_.state2state_inspection_capture_max_jerk);
+        fmt::print(fg(fmt::color::cyan),
+                   " -- [Inspection] CAPTURE_VIEWPOINT uses motion limits v/a/j=({:.2f}/{:.2f}/{:.2f}).\n",
+                   cfg_.state2state_inspection_capture_max_vel,
+                   cfg_.state2state_inspection_capture_max_acc,
+                   cfg_.state2state_inspection_capture_max_jerk);
+    }
+
+    void Fsm::cancelInspectionMission(const std::string &reason) {
+        if (inspection_mission_ && inspection_mission_->active()) {
+            inspection_mission_->cancel(reason);
+            // HOME navigation role is set by submitMissionNavigationGoal inside cancel.
+        }
     }
 
     bool Fsm::state2stateMode() const {
@@ -1628,6 +1947,23 @@ namespace fsm {
             ChangeState(source, GENERATE_TRAJ);
         } else {
             ChangeState(source, WAIT_GOAL);
+            if (close_to_goal &&
+                inspection_mission_ &&
+                active_navigation_role_ != mission::NavigationRole::EXTERNAL_CLICK) {
+                mission::MissionPose robot;
+                robot.position = Eigen::Vector3d(robot_state_.p.x(), robot_state_.p.y(),
+                                                 robot_state_.p.z());
+                robot.yaw = geometry_utils::get_yaw_from_quaternion(robot_state_.q);
+                const auto role = active_navigation_role_;
+                inspection_mission_->onNavigationSucceeded(role, robot);
+                if (!inspection_mission_->active()) {
+                    active_navigation_role_ = mission::NavigationRole::EXTERNAL_CLICK;
+                    applyInspectionMotionProfile(
+                            mission::NavigationRole::EXTERNAL_CLICK);
+                    applyInspectionTopologyPolicy(
+                            mission::NavigationRole::EXTERNAL_CLICK);
+                }
+            }
         }
         result.state_changed = true;
         return result;
@@ -1914,6 +2250,25 @@ namespace fsm {
     void Fsm::setGoalPosiAndYaw(const Vec3f &p,
                                 const Quatf &q,
                                 const GoalHeightMode height_mode) {
+        // External RViz clicks during an active inspection mission cancel it
+        // and are otherwise rejected so they cannot overwrite mission goals.
+        if (!mission_goal_submission_) {
+            if (inspectionMissionActive()) {
+                cancelInspectionMission("external_click_cancel");
+                recordDiagnosticEvent("WARN",
+                                      "goal_rejected",
+                                      "reason=inspection_mission_active_click_cancels_mission",
+                                      -1,
+                                      -1,
+                                      false,
+                                      -1,
+                                      0);
+                return;
+            }
+            active_navigation_role_ = mission::NavigationRole::EXTERNAL_CLICK;
+            applyInspectionMotionProfile(mission::NavigationRole::EXTERNAL_CLICK);
+            applyInspectionTopologyPolicy(mission::NavigationRole::EXTERNAL_CLICK);
+        }
 
         if (!p.allFinite()) {
             recordDiagnosticEvent("WARN",
@@ -2028,7 +2383,7 @@ namespace fsm {
 
         started_ = true;
         gi_.new_goal = true;
-        state2state_plan_from_rest_fail_count_ = 0;
+        resetState2StatePlanFromRestFailure();
         recordDiagnosticEvent("INFO",
                               "goal_accepted",
                               fmt::format("projected=[{:.3f},{:.3f},{:.3f}];projection_distance={:.3f};goal_yaw={:.3f};had_goal={}",

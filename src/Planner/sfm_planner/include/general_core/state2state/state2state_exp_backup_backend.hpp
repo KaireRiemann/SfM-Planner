@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -66,10 +67,26 @@ struct State2StateZDebug {
     double z_floor_min_margin{0.0};
 };
 
+// Optional role-specific limits for a state2state task.  Zero means the
+// normal navigation profile from Config; a valid override can only tighten
+// those limits and is used for slow capture-to-capture viewpoint motion.
+struct State2StateMotionLimits {
+    double max_vel{0.0};
+    double max_acc{0.0};
+    double max_jerk{0.0};
+
+    bool enabled() const {
+        return std::isfinite(max_vel) && std::isfinite(max_acc) &&
+               std::isfinite(max_jerk) && max_vel > 0.0 && max_acc > 0.0 &&
+               max_jerk > 0.0;
+    }
+};
+
 struct StateToStateExpBackendServices {
     StateToStateFrontendServices frontend;
     RuntimeTrajectorySafetyServices runtime_safety;
     const Config &cfg;
+    const State2StateMotionLimits &motion_limits;
     std::shared_ptr<MapManager> map_manager;
     std::shared_ptr<CorridorGenerator> corridor_generator;
     std::shared_ptr<ros_interface::RosInterface> ros_ptr;

@@ -86,21 +86,42 @@ namespace general_planner {
         general_utils::Vec3f dynamic_obstacle_layer_local_half_size{10.0, 10.0, 3.0};
         bool state2state_direct_line_frontend_enable{true};
         bool state2state_topology_enable{false};
-        bool state2state_topology_query_enable{false};
-        std::string state2state_topology_construction_mode{"bubble_topology"};
+        // Build/query capability only. Inspection still enables consumption
+        // only on RETURN_HOME through Fsm::applyInspectionTopologyPolicy.
+        bool state2state_topology_query_capability_enable{false};
+        std::string state2state_topology_selection_topic{
+            "/planner/navigation/use_global_topology"};
+        std::string state2state_topology_construction_mode{
+            "persistent_bubble_skeleton"};
         bool state2state_topology_unknown_as_free{false};
         bool state2state_topology_planar_mode{false};
         double state2state_topology_navigation_altitude{-1.0e6};
         double state2state_topology_min_query_distance{3.0};
+        double state2state_topology_local_prefix_length{8.0};
+        double state2state_topology_local_boundary_margin{0.8};
+        int state2state_topology_route_rejoin_max_candidates{3};
+        double state2state_topology_route_deviation_requery_distance{1.0};
+        double state2state_topology_route_query_min_interval{0.5};
+        // RETURN_HOME is safety critical: a graph prefix that merely points
+        // toward home is not a return route.  Use the verified outward trace
+        // when topology cannot prove full connectivity.
+        bool state2state_topology_home_require_complete_route{true};
+        bool state2state_topology_breadcrumb_enable{true};
+        double state2state_topology_breadcrumb_spacing{0.5};
+        double state2state_topology_breadcrumb_max_segment{1.0};
+        double state2state_topology_breadcrumb_attach_radius{1.5};
+        int state2state_topology_breadcrumb_max_points{2000};
         int state2state_topology_update_budget{1};
         double state2state_topology_update_period{0.20};
         double state2state_topology_publish_period{0.50};
         double state2state_topology_region_size{4.0};
         double state2state_topology_sample_spacing{1.0};
-        double state2state_topology_evidence_vertical_tolerance{0.50};
         double state2state_topology_min_clearance{0.45};
         double state2state_topology_max_clearance{2.5};
+        double state2state_topology_candidate_separation{1.5};
+        double state2state_topology_stable_match_distance{1.0};
         double state2state_topology_connection_radius{6.0};
+        double state2state_topology_edge_sample_spacing{0.20};
         double state2state_topology_dirty_padding{2.5};
         double state2state_topology_bubble_overlap_margin{0.10};
         int state2state_topology_max_nodes_per_region{4};
@@ -474,11 +495,19 @@ namespace general_planner {
                              state2state_direct_line_frontend_enable, true);
             loader.LoadParam("general_planner/state2state/topology/enable",
                              state2state_topology_enable, false);
-            loader.LoadParam("general_planner/state2state/topology/query_enable",
-                             state2state_topology_query_enable, false);
+            if (!loader.LoadParam(
+                    "general_planner/state2state/topology/query_capability_enable",
+                    state2state_topology_query_capability_enable, false)) {
+                loader.LoadParam("general_planner/state2state/topology/query_enable",
+                                 state2state_topology_query_capability_enable,
+                                 false);
+            }
+            loader.LoadParam("general_planner/state2state/topology/selection_topic",
+                             state2state_topology_selection_topic,
+                             std::string{"/planner/navigation/use_global_topology"});
             loader.LoadParam("general_planner/state2state/topology/construction_mode",
                              state2state_topology_construction_mode,
-                             std::string{"bubble_topology"});
+                             std::string{"persistent_bubble_skeleton"});
             loader.LoadParam("general_planner/state2state/topology/unknown_as_free",
                              state2state_topology_unknown_as_free, false);
             loader.LoadParam("general_planner/state2state/topology/planar_mode",
@@ -487,6 +516,37 @@ namespace general_planner {
                              state2state_topology_navigation_altitude, -1.0e6);
             loader.LoadParam("general_planner/state2state/topology/min_query_distance",
                              state2state_topology_min_query_distance, 3.0);
+            loader.LoadParam("general_planner/state2state/topology/local_prefix_length",
+                             state2state_topology_local_prefix_length, 8.0);
+            loader.LoadParam("general_planner/state2state/topology/local_boundary_margin",
+                             state2state_topology_local_boundary_margin, 0.8);
+            loader.LoadParam(
+                "general_planner/state2state/topology/route_rejoin_max_candidates",
+                state2state_topology_route_rejoin_max_candidates, 3);
+            loader.LoadParam(
+                "general_planner/state2state/topology/route_deviation_requery_distance",
+                state2state_topology_route_deviation_requery_distance, 1.0);
+            loader.LoadParam(
+                "general_planner/state2state/topology/route_query_min_interval",
+                state2state_topology_route_query_min_interval, 0.5);
+            loader.LoadParam(
+                "general_planner/state2state/topology/home_require_complete_route",
+                state2state_topology_home_require_complete_route, true);
+            loader.LoadParam(
+                "general_planner/state2state/topology/breadcrumb_enable",
+                state2state_topology_breadcrumb_enable, true);
+            loader.LoadParam(
+                "general_planner/state2state/topology/breadcrumb_spacing",
+                state2state_topology_breadcrumb_spacing, 0.5);
+            loader.LoadParam(
+                "general_planner/state2state/topology/breadcrumb_max_segment",
+                state2state_topology_breadcrumb_max_segment, 1.0);
+            loader.LoadParam(
+                "general_planner/state2state/topology/breadcrumb_attach_radius",
+                state2state_topology_breadcrumb_attach_radius, 1.5);
+            loader.LoadParam(
+                "general_planner/state2state/topology/breadcrumb_max_points",
+                state2state_topology_breadcrumb_max_points, 2000);
             loader.LoadParam("general_planner/state2state/topology/update_budget",
                              state2state_topology_update_budget, 1);
             loader.LoadParam("general_planner/state2state/topology/update_period",
@@ -497,15 +557,18 @@ namespace general_planner {
                              state2state_topology_region_size, 4.0);
             loader.LoadParam("general_planner/state2state/topology/sample_spacing",
                              state2state_topology_sample_spacing, 1.0);
-            loader.LoadParam(
-                "general_planner/state2state/topology/evidence_vertical_tolerance",
-                state2state_topology_evidence_vertical_tolerance, 0.50);
             loader.LoadParam("general_planner/state2state/topology/min_clearance",
                              state2state_topology_min_clearance, 0.45);
             loader.LoadParam("general_planner/state2state/topology/max_clearance",
                              state2state_topology_max_clearance, 2.5);
+            loader.LoadParam("general_planner/state2state/topology/candidate_separation",
+                             state2state_topology_candidate_separation, 1.5);
+            loader.LoadParam("general_planner/state2state/topology/stable_match_distance",
+                             state2state_topology_stable_match_distance, 1.0);
             loader.LoadParam("general_planner/state2state/topology/connection_radius",
                              state2state_topology_connection_radius, 6.0);
+            loader.LoadParam("general_planner/state2state/topology/edge_sample_spacing",
+                             state2state_topology_edge_sample_spacing, 0.20);
             loader.LoadParam("general_planner/state2state/topology/dirty_padding",
                              state2state_topology_dirty_padding, 2.5);
             loader.LoadParam("general_planner/state2state/topology/bubble_overlap_margin",

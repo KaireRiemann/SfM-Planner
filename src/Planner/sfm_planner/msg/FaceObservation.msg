@@ -1,0 +1,12 @@
+std_msgs/Header header
+string mission_id
+uint32 target_version
+uint32 request_id
+bool valid
+geometry_msgs/Point center
+geometry_msgs/Vector3 normal
+float64 width
+float64 height
+float64 area
+float64 confidence
+sensor_msgs/PointCloud2 surface_cloud

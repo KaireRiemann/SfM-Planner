@@ -47,6 +47,7 @@ namespace general_planner {
                 ros_ptr_,
                 astar_ptr_,
                 dynamic_obstacle_layer_.get(),
+                &state2state_topology_route_runtime_,
                 local_start_p_,
                 gi_.goal_p,
                 gi_.goal_valid
@@ -62,6 +63,7 @@ namespace general_planner {
                         dynamic_obstacle_layer_.get()
                 },
                 cfg_,
+                state2state_motion_limits_,
                 map_manager_,
                 cg_ptr_,
                 ros_ptr_,
@@ -213,7 +215,13 @@ namespace general_planner {
 
         {
             TimeConsuming t_viz("viz goal path", false);
-            services.ros_ptr->vizGoalPath(viz_pts);
+            const bool topology_policy =
+                    exp_services.frontend.topology_route_runtime != nullptr &&
+                    exp_services.frontend.topology_route_runtime->policy_enabled.load(
+                            std::memory_order_acquire);
+            if (!topology_policy) {
+                services.ros_ptr->vizGoalPath(viz_pts);
+            }
             services.time_consuming[VISUALIZATION] += t_viz.stop();
         }
 
@@ -390,7 +398,13 @@ namespace general_planner {
 
         {
             TimeConsuming t_viz("tviz", false);
-            services.ros_ptr->vizGoalPath(viz_pts);
+            const bool topology_policy =
+                    exp_services.frontend.topology_route_runtime != nullptr &&
+                    exp_services.frontend.topology_route_runtime->policy_enabled.load(
+                            std::memory_order_acquire);
+            if (!topology_policy) {
+                services.ros_ptr->vizGoalPath(viz_pts);
+            }
             services.time_consuming[VISUALIZATION] += t_viz.stop();
         }
 

@@ -67,7 +67,22 @@ MissionPlanner
   └─ 发送 NavigationRequest(HOME)              → state2state
 ```
 
-`state2state` 始终只看到一个当前目标。前往先验目标、拍摄视点和 Home 都复用当前的点到点规划、障碍物检查和滚动重规划能力。
+`state2state` 始终只看到一个当前目标。前往先验目标和拍摄视点仍用局部直线/A*；`RETURN_HOME` 则采用保守的双层路线：先要求 topo A* 给出**真正连到 Home**的全局骨架；图尚未连通时，反向执行去程和拍摄阶段实际飞过、且已在局部膨胀地图中验证过的 breadcrumb。两者均不可用时，长距离返航拒绝退化为普通直线/A*，保持当前位置并报告失败，而不是穿过未知区域。
+
+### 3.2 Topo 与 verified breadcrumb 返航
+
+```text
+起飞 Home
+  → 每 0.5 m 记录一次已执行轨迹
+  → 对每段执行 KNOWN_FREE + inflated line check
+  → accepted segment 同时写入 breadcrumb 与 topo evidence seed
+  → RETURN_HOME:
+      complete topo A* to Home ?  使用 topo prefix
+      : breadcrumb 可附着 ?       反向 retrace breadcrumb prefix
+      :                           停止当前返航规划并报告不可达
+```
+
+breadcrumb 不是规划器预测路径，也不把 Unknown 标为 Free；它是当前任务生命期内的已验证安全走廊。Topo 图则可在这些已验证 seed 及 LiDAR 状态变化的基础上逐步产生替代通路。每次只交给局部规划器前方有限 prefix，prefix 仍需在当前地图重新验证；新 topo snapshot 发布后，旧 topo 路线在查询间隔后会重新搜索。
 
 ## 4. 任务状态机
 
@@ -192,6 +207,7 @@ map_version: map_0012
 
 face_center: [32.41, -1.28, 2.36]
 face_normal: [-0.998, 0.041, 0.027]
+face_prior_valid: true
 nav_goal: [29.42, -1.16, 2.44]
 goal_yaw: 0.03
 confidence: 0.91
@@ -236,13 +252,16 @@ struct FaceObservation {
   → FaceObservation
 ```
 
-隧道前进方向优先使用：
+每一轮识别的 ROI 前进方向由该轮导航目标的朝向定义：
 
 ```text
-tunnel_dir = -active_target.face_normal
+tunnel_dir = [cos(active_target.goal_yaw), sin(active_target.goal_yaw), 0]
 ```
 
-首任务没有先验法向时，使用 `Home → 初始目标` 的方向或现场配置方向。
+因此首任务可直接使用人工给定的 `(nav_goal, goal_yaw)` 作为观察锚点；不应从
+上一次识别面的法向推导方向。`face_prior_valid: false` 表示该锚点没有可用几何先验，
+检测器不会以其 `face_center/face_normal` 过滤候选。完整拍摄成功后，任务把新检测结果
+覆盖写回为 `face_prior_valid: true` 的目标；后续轮次才可选用中心与法向先验。
 
 候选掌子面应满足：
 
@@ -385,7 +404,7 @@ visible(i, j) =
 | 接口 | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
 | `/inspection/start` | `StartInspection.srv` | 输入 | 触发一次任务 |
-| `/inspection/face/request` | `std_msgs/Empty` | 输出 | 请求外部掌子面识别 |
+| `/inspection/face/request` | `FaceDetectionRequest.msg` | 输出 | 请求外部掌子面识别，并携带任务关联字段 |
 | `/inspection/face/result` | `FaceObservation.msg` | 输入 | 返回掌子面几何和表面点云 |
 | `/inspection/capture/request` | `CaptureRequest.msg` | 输出 | 请求云台在指定视点拍摄 |
 | `/inspection/capture/result` | `CaptureResult.msg` | 输入 | 返回拍照是否成功 |
@@ -393,10 +412,24 @@ visible(i, j) =
 
 ### 9.2 建议消息
 
+所有感知和拍摄请求/结果必须携带同一组关联键：`mission_id`、`target_version`、`request_id`。任务层只接收与当前等待请求完全匹配的消息，避免上一轮任务的延迟结果推进新任务。
+
+`FaceDetectionRequest.msg`：
+
+```text
+std_msgs/Header header
+string mission_id
+uint32 target_version
+uint32 request_id
+```
+
 `FaceObservation.msg`：
 
 ```text
 std_msgs/Header header
+string mission_id
+uint32 target_version
+uint32 request_id
 bool valid
 geometry_msgs/Point center
 geometry_msgs/Vector3 normal
@@ -411,6 +444,9 @@ sensor_msgs/PointCloud2 surface_cloud
 
 ```text
 std_msgs/Header header
+string mission_id
+uint32 target_version
+uint32 request_id
 uint32 viewpoint_id
 bool success
 string image_id
@@ -486,8 +522,8 @@ bool submitMissionNavigationGoal(const Pose& goal, NavigationRole role);
 并为 ROS 层增加虚函数：
 
 ```cpp
-virtual void publishFaceDetectionRequest() {}
-virtual void publishCaptureRequest(const CaptureViewpoint&) {}
+virtual void publishFaceDetectionRequest(const FaceDetectionRequest&) {}
+virtual void publishCaptureRequest(const CaptureCommand&) {}
 virtual void publishMissionStatus(...) {}
 ```
 
@@ -528,6 +564,7 @@ ros::Publisher mission_status_pub_;
 add_message_files(
   FILES
   FaceObservation.msg
+  FaceDetectionRequest.msg
   CaptureRequest.msg
   CaptureResult.msg
   MissionStatus.msg
@@ -550,11 +587,32 @@ generate_messages(
 ```yaml
 inspection_mission:
   enable: true
+  # MaRSIM 激光-only 联调：只验证到达 nav_goal，不触发或伪造识别/拍摄成功。
+  navigation_only: false
+  # 首帧新鲜里程计到达后自动执行一次任务；launch 全流程联调可设为 true。
+  auto_start: false
+  # 2D /goal 的 XY 作为本次任务接近航点。
+  trigger_from_2d_goal: false
+  # 无识别器时用 mission_target 中已有掌子面几何直接生成视点；
+  # 此路径不会覆盖更新 target。
+  skip_face_detection: false
+  # 默认直接飞向 target_file 中明确配置的 nav_goal。
+  use_target_nav_goal_directly: true
+  # 外部识别、相机回执的最大等待时间；超时后安全返航。
+  face_result_timeout_sec: 15.0
+  capture_result_timeout_sec: 10.0
   target_file: "config/mission_target.yaml"
 
   start_service: "/inspection/start"
   face_request_topic: "/inspection/face/request"
   face_result_topic: "/inspection/face/result"
+  # MaRSIM can run the LiDAR detector while capture acknowledgement remains
+  # simulated.  The debug topic contains only accepted plane detections.
+  cloud_topic: "/cloud_registered"
+  mock_face_detection: false
+  mock_capture: true
+  use_internal_detector: true
+  face_debug_topic: "/inspection/face/debug"
   capture_request_topic: "/inspection/capture/request"
   capture_result_topic: "/inspection/capture/result"
   status_topic: "/inspection/status"
@@ -573,6 +631,16 @@ inspection_mission:
     min_area: 4.0
     min_points: 300
     normal_alignment_min: 0.8
+    cluster_tolerance: 0.35
+    cluster_min_size: 200
+    ransac_dist: 0.08
+    stability_frames: 3
+    stability_center_tol: 0.35
+    stability_normal_tol: 0.15
+    # The detected plane must also agree with the coarse prior from
+    # mission_target; this prevents a far tunnel wall from becoming the face.
+    prior_center_tolerance: 3.0
+    prior_normal_alignment_min: 0.9
 
   coverage:
     camera_hfov_deg: 70.0
@@ -581,6 +649,8 @@ inspection_mission:
     image_overlap: 0.7
     min_observation_count: 2
     min_baseline_angle_deg: 8.0
+    min_predicted_coverage: 0.95
+    max_viewpoints: 60
 ```
 
 以上数值仅用于说明配置结构，必须通过现场基准测试确定。
@@ -588,6 +658,40 @@ inspection_mission:
 ## 12. 实施阶段与验收
 
 ### 阶段 A：任务导航闭环
+
+在没有相机模型的 MaRSIM 中，存在两种互不混淆的测试路径：
+
+1. 设置 `navigation_only: true`，只验证 `GO_TO_TARGET → RETURN_HOME → FINISHED(navigation_only_complete)`；绝不写回目标文件。
+2. 设置 `use_internal_detector: true`、`mock_face_detection: false`、`mock_capture: true`，从 MaRSIM 的 `/cloud_registered`（`world` 系）检测掌子面平面，生成视点；仅相机回执为模拟。成功检测会发布到 `/inspection/face/debug`，可用 `rostopic echo` 记录中心、法向、面积和置信度。该模式可验证点云检测和视点规划，但不能把模拟拍摄解释为真实影像覆盖。
+
+若设置 `auto_start: true`，节点会等待第一帧新鲜里程计后自动触发一次任务；若设置 `trigger_from_2d_goal: true`，则由每个 2D `/goal` 消息触发一次任务。
+
+当前 `inspection_mission.launch` 默认复用 `click_cave1.launch` 的 MaRSIM 场景
+基准：`cave1.yaml`（起飞位置 `(68.5, -29.0, 1.5)`、`cave1.pcd`）和
+`click_real_highspeed.yaml` 的规划参数。巡检层使用其副本
+`click_inspection.yaml`，并以 `mission_target_marsim_cave1.yaml` 保存 PCD 标定的
+首个接近航点与掌子面先验。ROS1 环境中的最小复现实验为：
+
+```bash
+roslaunch sfm_planner inspection_mission.launch
+rosservice call /inspection/start "{}"
+rostopic echo /inspection/status
+rostopic echo /inspection/face/debug
+```
+
+验收时记录 `/inspection/face/debug` 的 `center`、`normal`、`area`、`confidence`
+和 `surface_cloud` 点数，并核对状态顺序为 `WAIT_FACE_RESULT → PLAN_VIEWS →
+GO_TO_VIEWPOINT → RETURN_HOME → FINISHED`。该配置的 `mock_capture: true` 会让完整
+任务在视点到达后继续执行并覆盖写回**仿真专用** target 文件；若要反复使用同一初始
+先验，在每轮实验前从版本库还原该文件。
+
+若要验证“到航点后生成视点”但暂时没有掌子面识别器，设置 `navigation_only: false`、`skip_face_detection: true`、`trigger_from_2d_goal: true`。任务会把 2D `/goal` 作为接近航点，读取 `mission_target.yaml` 的 `face_center`、`face_normal` 和 `change_region.width/height` 生成先验视点；该路径不提交新的 `MissionTarget`。
+
+完整巡检模式设置 `trigger_from_2d_goal: false`、`skip_face_detection: false`、`use_target_nav_goal_directly: true`，通过 `/inspection/start` 触发。任务在启动时记录当前位置为 home，然后严格按 `GO_TO_TARGET → WAIT_FACE_RESULT → PLAN_VIEWS → GO_TO_VIEWPOINT/WAIT_CAPTURE_RESULT → RETURN_HOME` 执行；仅在全部拍照成功后才覆盖写回新的目标文件。
+
+每个巡检导航腿的完成条件是位置误差小于 0.1 m，且航向误差小于
+`inspection_mission.arrival_yaw_tolerance_rad`。这保证在目标点仍在转向时不会提前开始
+识别或触发相机；状态机将等待（必要时重规划）原地转向至目标 yaw。
 
 1. 实现 `MissionTarget` 的加载、原子保存和版本覆盖。
 2. 实现 `InspectionMissionPlanner`。

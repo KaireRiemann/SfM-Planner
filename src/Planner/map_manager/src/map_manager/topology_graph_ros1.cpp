@@ -3,6 +3,7 @@
 #ifdef USE_ROS1
 
 #include <algorithm>
+#include <chrono>
 #include <unordered_map>
 #include <utility>
 
@@ -23,18 +24,18 @@ TopologyGraphROS1::TopologyGraphROS1(
         ? std::string{} : parameter_namespace + "/";
     node_.param(prefix + "enabled", config.enabled, config.enabled);
     std::string construction_mode =
-        config.dense_known_free ? "dense_known_free" : "bubble_topology";
+        IncrementalTopologyGraph::constructionModeName(
+            config.construction_mode);
     node_.param(prefix + "construction_mode", construction_mode,
                 construction_mode);
-    config.dense_known_free = construction_mode == "dense_known_free";
+    config.construction_mode =
+        IncrementalTopologyGraph::constructionModeFromString(
+            construction_mode);
     node_.param(prefix + "planar_mode", config.planar_mode, config.planar_mode);
     node_.param(prefix + "navigation_altitude", config.navigation_altitude,
                 config.navigation_altitude);
     node_.param(prefix + "region_size", config.region_size, config.region_size);
     node_.param(prefix + "sample_spacing", config.sample_spacing, config.sample_spacing);
-    node_.param(prefix + "evidence_vertical_tolerance",
-                config.dense_evidence_vertical_tolerance,
-                config.dense_evidence_vertical_tolerance);
     node_.param(prefix + "min_clearance", config.min_clearance, config.min_clearance);
     node_.param(prefix + "max_clearance", config.max_clearance, config.max_clearance);
     node_.param(prefix + "candidate_separation", config.candidate_separation,
@@ -75,8 +76,9 @@ TopologyGraphROS1::TopologyGraphROS1(
     node_.param(prefix + "topic", topic, topic);
     node_.param(prefix + "update_period", update_period, update_period);
     node_.param(prefix + "publish_period", publish_period, publish_period);
+    update_period_ = std::max(0.02, update_period);
     publish_period_ = std::max(0.05, publish_period);
-    config.update_period = std::max(0.02, update_period);
+    config.update_period = update_period_;
     config.publish_period = publish_period_;
     node_.param(prefix + "node_scale", node_scale_, node_scale_);
     node_.param(prefix + "edge_scale", edge_scale_, edge_scale_);
@@ -89,14 +91,14 @@ TopologyGraphROS1::TopologyGraphROS1(
     map_manager->setTopologyActive(missionActive());
     publisher_ = node_.advertise<visualization_msgs::MarkerArray>(topic, 1, true);
     worker_ = std::thread(&TopologyGraphROS1::workerLoop, this);
-    timer_ = node_.createTimer(ros::Duration(std::max(0.02, update_period)),
+    timer_ = node_.createTimer(ros::Duration(update_period_),
                                &TopologyGraphROS1::timerCallback, this);
     if (missionActive()) {
         updateAndPublish();
     }
-    ROS_INFO_STREAM("[map_manager] State2state incremental topology enabled, mode: "
-                    << (config.dense_known_free
-                            ? "dense_known_free" : "bubble_topology")
+    ROS_INFO_STREAM("[map_manager] Incremental topology enabled, mode: "
+                    << IncrementalTopologyGraph::constructionModeName(
+                           config.construction_mode)
                     << ", topic: "
                     << node_.resolveName(topic)
                     << ", update=" << config.update_period
@@ -121,15 +123,10 @@ bool TopologyGraphROS1::missionActive() const {
 }
 
 void TopologyGraphROS1::timerCallback(const ros::TimerEvent &) {
-    const auto manager = map_manager_.lock();
-    if (!enabled_ || !manager) {
-        return;
-    }
-    const bool active = missionActive();
-    manager->setTopologyActive(active);
-    if (!active) {
-        return;
-    }
+    // The worker performs the mission gate and owns the periodic fallback.
+    // Keep this ROS-timer path as a compatibility wake-up only: when the
+    // shared queue is busy it may be delayed indefinitely, which must not
+    // suppress maintenance of the global topology.
     updateAndPublish();
 }
 
@@ -145,30 +142,82 @@ void TopologyGraphROS1::updateAndPublish() {
 }
 
 void TopologyGraphROS1::workerLoop() {
+    using Clock = std::chrono::steady_clock;
+    const auto period = std::chrono::duration_cast<Clock::duration>(
+        std::chrono::duration<double>(update_period_));
+    // Run once immediately for startup, then no faster than update_period_.
+    // Requests received in between are intentionally coalesced.
+    auto next_update = Clock::now();
     for (;;) {
         {
             std::unique_lock<std::mutex> lock(worker_mutex_);
-            worker_cv_.wait(lock, [this]() {
+            worker_cv_.wait_until(lock, next_update, [this]() {
                 return stopping_ || update_requested_;
             });
             if (stopping_) {
                 return;
             }
+            // A map-fusion request may arrive before the configured budget is
+            // available.  Preserve the rate limit while retaining the request
+            // as coalesced work for this tick.  Only shutdown may interrupt
+            // this wait; otherwise a high-rate cloud topic could spin the
+            // worker at sensor rate.
+            if (Clock::now() < next_update) {
+                worker_cv_.wait_until(lock, next_update, [this]() {
+                    return stopping_;
+                });
+                if (stopping_) {
+                    return;
+                }
+            }
             update_requested_ = false;
         }
 
         const auto manager = map_manager_.lock();
-        if (!manager || !manager->topologyReady()) {
-            continue;
+        if (enabled_ && manager) {
+            // This must live in the worker rather than the ROS timer.  The
+            // runtime-wide graph has no mode callback and remains active;
+            // standalone state2state users still receive the same mission
+            // gate at the configured maintenance cadence.
+            const bool active = missionActive();
+            manager->setTopologyActive(active);
+            if (active && manager->topologyReady()) {
+                const ros::WallTime update_begin = ros::WallTime::now();
+                const std::size_t processed =
+                    manager->updateTopology(max_regions_per_tick_);
+                const double update_ms =
+                    (ros::WallTime::now() - update_begin).toSec() * 1000.0;
+                const auto stats = manager->topologyGraph()->stats();
+                const double average_degree = stats.node_count > 0
+                    ? 2.0 * static_cast<double>(stats.edge_count) /
+                          static_cast<double>(stats.node_count)
+                    : 0.0;
+                ROS_INFO_STREAM_THROTTLE(
+                    1.0, "[topology update] processed=" << processed
+                         << " dirty=" << stats.dirty_region_count
+                         << " nodes=" << stats.node_count
+                         << " edges=" << stats.edge_count
+                         << " avg_degree=" << average_degree
+                         << " cost=" << update_ms << "ms");
+                if (update_ms > update_period_ * 1000.0) {
+                    ROS_WARN_STREAM_THROTTLE(
+                        1.0, "[topology update] worker exceeds period: cost="
+                             << update_ms << "ms period="
+                             << update_period_ * 1000.0
+                             << "ms; updates are being coalesced");
+                }
+                const ros::WallTime now = ros::WallTime::now();
+                if (last_publish_time_.isZero() ||
+                    (now - last_publish_time_).toSec() >= publish_period_) {
+                    manager->topologyGraph()->refreshSnapshot();
+                    publisher_.publish(makeMarkers(manager->topologySnapshot()));
+                    last_publish_time_ = now;
+                }
+            }
         }
-        manager->updateTopology(max_regions_per_tick_);
-        const ros::WallTime now = ros::WallTime::now();
-        if (last_publish_time_.isZero() ||
-            (now - last_publish_time_).toSec() >= publish_period_) {
-            manager->topologyGraph()->refreshSnapshot();
-            publisher_.publish(makeMarkers(manager->topologySnapshot()));
-            last_publish_time_ = now;
-        }
+        // Do not attempt to catch up after a costly rebuild: a bounded rate
+        // keeps topology maintenance from competing with map fusion.
+        next_update = Clock::now() + period;
     }
 }
 
@@ -176,12 +225,6 @@ visualization_msgs::MarkerArray TopologyGraphROS1::makeMarkers(
     const IncrementalTopologyGraph::Snapshot &snapshot) const {
     visualization_msgs::MarkerArray output;
     const ros::Time stamp = ros::Time::now();
-
-    visualization_msgs::Marker clear;
-    clear.header.frame_id = frame_id_;
-    clear.header.stamp = stamp;
-    clear.action = visualization_msgs::Marker::DELETEALL;
-    output.markers.push_back(clear);
 
     visualization_msgs::Marker nodes;
     nodes.header.frame_id = frame_id_;
@@ -194,19 +237,34 @@ visualization_msgs::MarkerArray TopologyGraphROS1::makeMarkers(
     nodes.scale.x = node_scale_;
     nodes.scale.y = node_scale_;
     nodes.scale.z = node_scale_;
-    nodes.color.r = 0.10F;
-    nodes.color.g = 0.85F;
-    nodes.color.b = 0.95F;
-    nodes.color.a = 0.95F;
+    nodes.color.r = 1.0F;
+    nodes.color.g = 1.0F;
+    nodes.color.b = 1.0F;
+    nodes.color.a = 1.0F;
 
     std::unordered_map<IncrementalTopologyGraph::NodeId, rog_map::Vec3f> positions;
     positions.reserve(snapshot.nodes.size());
+    std::size_t historical_nodes = 0;
     for (const auto &node : snapshot.nodes) {
         geometry_msgs::Point point;
         point.x = node.position.x();
         point.y = node.position.y();
         point.z = node.position.z();
         nodes.points.push_back(point);
+        std_msgs::ColorRGBA color;
+        if (node.state == IncrementalTopologyGraph::NodeState::HISTORICAL) {
+            color.r = 0.95F;
+            color.g = 0.65F;
+            color.b = 0.15F;
+            color.a = 0.80F;
+            ++historical_nodes;
+        } else {
+            color.r = 0.10F;
+            color.g = 0.85F;
+            color.b = 0.95F;
+            color.a = 0.95F;
+        }
+        nodes.colors.push_back(color);
         positions.emplace(node.id, node.position);
     }
     output.markers.push_back(nodes);
@@ -262,12 +320,20 @@ visualization_msgs::MarkerArray TopologyGraphROS1::makeMarkers(
     status.color.b = 1.0F;
     status.color.a = 0.9F;
     status.text = std::string{"topology mode="} +
-                  (snapshot.dense_known_free
-                       ? "dense_known_free" : "bubble_topology") +
+                  IncrementalTopologyGraph::constructionModeName(
+                      snapshot.construction_mode) +
                   " nodes=" + std::to_string(snapshot.nodes.size()) +
+                  " active=" +
+                  std::to_string(snapshot.nodes.size() - historical_nodes) +
+                  " historical=" + std::to_string(historical_nodes) +
                   " edges=" + std::to_string(snapshot.edges.size()) +
-                  " evidence=" +
-                  std::to_string(snapshot.dense_evidence_cell_count) +
+                  " avg_degree=" + std::to_string(
+                      snapshot.nodes.empty()
+                          ? 0.0
+                          : 2.0 * static_cast<double>(snapshot.edges.size()) /
+                                static_cast<double>(snapshot.nodes.size())) +
+                  " known_free=" +
+                  std::to_string(snapshot.known_free_cell_count) +
                   " dirty=" + std::to_string(snapshot.dirty_region_count) +
                   " rev=" + std::to_string(snapshot.revision) +
                   " empty=" + std::to_string(snapshot.empty_region_count) +

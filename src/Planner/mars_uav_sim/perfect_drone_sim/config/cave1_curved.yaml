@@ -1,0 +1,22 @@
+#############| For UAV simulation |#################################
+# cave1 with a curved (non-planar) end face for SfM / inspection tests.
+pcd_name: "cave1_curved_face.pcd"
+mesh_resource: "package://perfect_drone_sim/meshes/yunque-M.dae"
+init_position:
+  x: 68.5
+  y: -29.0
+  z: 1.5
+init_yaw: 0.0
+
+#############|For LiDAR perception simulation |#################################
+is_360lidar: true
+polar_resolution: 0.4
+downsample_res: 0.1
+vertical_fov: 178.0
+sensing_blind: 0.1
+sensing_horizon: 70
+sensing_rate: 10
+print_time_consumption: false
+lidar_type: 2
+depth_image_en: false
+track

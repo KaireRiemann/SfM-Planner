@@ -28,6 +28,7 @@
 
 #include <general_core/config.hpp>
 #include <general_core/planning_semantics.hpp>
+#include <mission/mission_types.hpp>
 #include <algorithm>
 #include <cctype>
 #include <vector>
@@ -198,6 +199,17 @@ namespace fsm {
         double dynamic_obstacle_layer_odom_timeout{0.2};
         double task_timeout{0.6};
         int state2state_plan_from_rest_max_failures{0};
+        double state2state_plan_from_rest_max_failure_sec{0.0};
+        // Inspection approach/return can legitimately wait for map evidence,
+        // while a capture-viewpoint retry must be bounded and rate-limited.
+        double state2state_inspection_capture_max_failure_sec{0.0};
+        double state2state_inspection_retry_backoff_initial_sec{0.15};
+        double state2state_inspection_retry_backoff_max_sec{1.0};
+        // Capture viewpoints are camera poses, not high-speed transit goals.
+        // Non-positive values retain the normal state2state navigation profile.
+        double state2state_inspection_capture_max_vel{0.0};
+        double state2state_inspection_capture_max_acc{0.0};
+        double state2state_inspection_capture_max_jerk{0.0};
         bool state2state_clear_goal_on_plan_failure{false};
         double yaw_dot_max{};
         bool diagnostic_log_en{true};
@@ -212,6 +224,8 @@ namespace fsm {
         string swarm_formation_reference_topic{"/swarm/formation_reference"};
         vector<string> swarm_traj_topics;
         vector<int> swarm_traj_ids;
+
+        mission::InspectionMissionConfig inspection_mission;
 
         Config() = default;
 
@@ -345,6 +359,27 @@ namespace fsm {
             loader.LoadParam("fsm/state2state_plan_from_rest_max_failures",
                              state2state_plan_from_rest_max_failures,
                              0);
+            loader.LoadParam("fsm/state2state_plan_from_rest_max_failure_sec",
+                             state2state_plan_from_rest_max_failure_sec,
+                             0.0);
+            loader.LoadParam("fsm/state2state_inspection_capture_max_failure_sec",
+                             state2state_inspection_capture_max_failure_sec,
+                             0.0);
+            loader.LoadParam("fsm/state2state_inspection_retry_backoff_initial_sec",
+                             state2state_inspection_retry_backoff_initial_sec,
+                             0.15);
+            loader.LoadParam("fsm/state2state_inspection_retry_backoff_max_sec",
+                             state2state_inspection_retry_backoff_max_sec,
+                             1.0);
+            loader.LoadParam("fsm/state2state_inspection_capture_max_vel",
+                             state2state_inspection_capture_max_vel,
+                             0.0);
+            loader.LoadParam("fsm/state2state_inspection_capture_max_acc",
+                             state2state_inspection_capture_max_acc,
+                             0.0);
+            loader.LoadParam("fsm/state2state_inspection_capture_max_jerk",
+                             state2state_inspection_capture_max_jerk,
+                             0.0);
             loader.LoadParam("fsm/state2state_clear_goal_on_plan_failure",
                              state2state_clear_goal_on_plan_failure,
                              false);
@@ -370,6 +405,131 @@ namespace fsm {
             loader.LoadParam("general_planner/yaw_dot_max", yaw_dot_max, 1.0, true);
             loader.LoadParam("general_planner/visualization_en", visualization_en, false, true);
             loader.LoadParam("rog_map/resolution", resolution, 0.1, true);
+
+            loader.LoadParam("inspection_mission/enable", inspection_mission.enable, false);
+            loader.LoadParam("inspection_mission/navigation_only",
+                             inspection_mission.navigation_only, false);
+            loader.LoadParam("inspection_mission/auto_start",
+                             inspection_mission.auto_start, false);
+            loader.LoadParam("inspection_mission/trigger_from_2d_goal",
+                             inspection_mission.trigger_from_2d_goal, false);
+            loader.LoadParam("inspection_mission/skip_face_detection",
+                             inspection_mission.skip_face_detection, false);
+            loader.LoadParam("inspection_mission/use_target_nav_goal_directly",
+                             inspection_mission.use_target_nav_goal_directly, true);
+            loader.LoadParam("inspection_mission/allow_mock_coverage_fallback",
+                             inspection_mission.allow_mock_coverage_fallback, false);
+            loader.LoadParam("inspection_mission/mock_external", inspection_mission.mock_external, true);
+            loader.LoadParam("inspection_mission/mock_face_detection",
+                             inspection_mission.mock_face_detection,
+                             inspection_mission.mock_external);
+            loader.LoadParam("inspection_mission/mock_capture",
+                             inspection_mission.mock_capture,
+                             inspection_mission.mock_external);
+            loader.LoadParam("inspection_mission/use_internal_detector",
+                             inspection_mission.use_internal_detector, false);
+            loader.LoadParam("inspection_mission/apply_change_region_mask",
+                             inspection_mission.apply_change_region_mask, true);
+            loader.LoadParam("inspection_mission/target_file", inspection_mission.target_file,
+                             string("config/mission_target.yaml"));
+            loader.LoadParam("inspection_mission/start_service", inspection_mission.start_service,
+                             string("/inspection/start"));
+            loader.LoadParam("inspection_mission/face_request_topic",
+                             inspection_mission.face_request_topic,
+                             string("/inspection/face/request"));
+            loader.LoadParam("inspection_mission/face_result_topic",
+                             inspection_mission.face_result_topic,
+                             string("/inspection/face/result"));
+            loader.LoadParam("inspection_mission/face_debug_topic",
+                             inspection_mission.face_debug_topic,
+                             string("/inspection/face/debug"));
+            loader.LoadParam("inspection_mission/capture_request_topic",
+                             inspection_mission.capture_request_topic,
+                             string("/inspection/capture/request"));
+            loader.LoadParam("inspection_mission/capture_result_topic",
+                             inspection_mission.capture_result_topic,
+                             string("/inspection/capture/result"));
+            loader.LoadParam("inspection_mission/status_topic", inspection_mission.status_topic,
+                             string("/inspection/status"));
+            loader.LoadParam("inspection_mission/cloud_topic", inspection_mission.cloud_topic,
+                             string("/cloud_registered"));
+            loader.LoadParam("inspection_mission/home_mode", inspection_mission.home_mode,
+                             string("capture_on_trigger"));
+            loader.LoadParam("inspection_mission/approach_distance_min",
+                             inspection_mission.approach_distance_min, 2.0);
+            loader.LoadParam("inspection_mission/approach_distance_max",
+                             inspection_mission.approach_distance_max, 4.0);
+            loader.LoadParam("inspection_mission/approach_distance_step",
+                             inspection_mission.approach_distance_step, 0.2);
+            loader.LoadParam("inspection_mission/safe_radius", inspection_mission.safe_radius, 0.6);
+            loader.LoadParam("inspection_mission/flight_height_min",
+                             inspection_mission.flight_height_min, 0.5);
+            loader.LoadParam("inspection_mission/flight_height_max",
+                             inspection_mission.flight_height_max, 5.0);
+            loader.LoadParam("inspection_mission/face/forward_min",
+                             inspection_mission.face_forward_min, 1.0);
+            loader.LoadParam("inspection_mission/face/forward_max",
+                             inspection_mission.face_forward_max, 12.0);
+            loader.LoadParam("inspection_mission/face/min_confidence",
+                             inspection_mission.face_min_confidence, 0.75);
+            loader.LoadParam("inspection_mission/face/min_area",
+                             inspection_mission.face_min_area, 4.0);
+            loader.LoadParam("inspection_mission/face/min_points",
+                             inspection_mission.face_min_points, 300);
+            loader.LoadParam("inspection_mission/face/normal_alignment_min",
+                             inspection_mission.face_normal_alignment_min, 0.8);
+            loader.LoadParam("inspection_mission/face/voxel_leaf",
+                             inspection_mission.face_voxel_leaf, 0.1);
+            loader.LoadParam("inspection_mission/face/stability_frames",
+                             inspection_mission.face_stability_frames, 3);
+            loader.LoadParam("inspection_mission/face/stability_center_tol",
+                             inspection_mission.face_stability_center_tol, 0.35);
+            loader.LoadParam("inspection_mission/face/stability_normal_tol",
+                             inspection_mission.face_stability_normal_tol, 0.15);
+            loader.LoadParam("inspection_mission/face/cluster_tolerance",
+                             inspection_mission.face_cluster_tolerance, 0.35);
+            loader.LoadParam("inspection_mission/face/cluster_min_size",
+                             inspection_mission.face_cluster_min_size, 200);
+            loader.LoadParam("inspection_mission/face/ransac_dist",
+                             inspection_mission.face_ransac_dist, 0.08);
+            loader.LoadParam("inspection_mission/face/prior_center_tolerance",
+                             inspection_mission.face_prior_center_tolerance, 3.0);
+            loader.LoadParam("inspection_mission/face/prior_normal_alignment_min",
+                             inspection_mission.face_prior_normal_alignment_min, 0.9);
+            loader.LoadParam("inspection_mission/coverage/camera_hfov_deg",
+                             inspection_mission.camera_hfov_deg, 70.0);
+            loader.LoadParam("inspection_mission/coverage/camera_vfov_deg",
+                             inspection_mission.camera_vfov_deg, 50.0);
+            loader.LoadParam("inspection_mission/coverage/capture_distance",
+                             inspection_mission.capture_distance, 4.0);
+            loader.LoadParam("inspection_mission/coverage/image_overlap",
+                             inspection_mission.image_overlap, 0.7);
+            loader.LoadParam("inspection_mission/coverage/min_observation_count",
+                             inspection_mission.min_observation_count, 2);
+            loader.LoadParam("inspection_mission/coverage/min_baseline_angle_deg",
+                             inspection_mission.min_baseline_angle_deg, 8.0);
+            loader.LoadParam("inspection_mission/coverage/max_incidence_angle_deg",
+                             inspection_mission.max_incidence_angle_deg, 60.0);
+            loader.LoadParam("inspection_mission/coverage/surface_sample_resolution",
+                             inspection_mission.surface_sample_resolution, 0.4);
+            loader.LoadParam("inspection_mission/coverage/visibility_unknown_as_occupied",
+                             inspection_mission.visibility_unknown_as_occupied, false);
+            loader.LoadParam("inspection_mission/coverage/min_predicted_coverage",
+                             inspection_mission.min_predicted_coverage, 0.95);
+            loader.LoadParam("inspection_mission/coverage/max_viewpoints",
+                             inspection_mission.max_viewpoints, 60);
+            loader.LoadParam("inspection_mission/coverage/capture_settle_time_sec",
+                             inspection_mission.capture_settle_time_sec, 0.5);
+            loader.LoadParam("inspection_mission/change_region_thickness",
+                             inspection_mission.change_region_thickness, 1.0);
+            loader.LoadParam("inspection_mission/fail_retry_count",
+                             inspection_mission.fail_retry_count, 1);
+            loader.LoadParam("inspection_mission/face_result_timeout_sec",
+                             inspection_mission.face_result_timeout_sec, 15.0);
+            loader.LoadParam("inspection_mission/capture_result_timeout_sec",
+                             inspection_mission.capture_result_timeout_sec, 10.0);
+            loader.LoadParam("inspection_mission/arrival_yaw_tolerance_rad",
+                             inspection_mission.arrival_yaw_tolerance_rad, 0.15);
 
         }
     };

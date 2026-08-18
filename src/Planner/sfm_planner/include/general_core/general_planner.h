@@ -57,6 +57,7 @@
 #include "general_core/state2state/state2state_exp_backup_backend.hpp"
 #include "general_core/state2state/state2state_plan_operations.hpp"
 #include "general_core/state2state/state2state_se3_backend.hpp"
+#include "general_core/state2state/state2state_topology_route.hpp"
 #include "general_core/state2state/se3_aggressive_manager.hpp"
 
 #include "general_core/general_ret_code.hpp"
@@ -109,6 +110,9 @@ namespace general_planner {
         double planner_process_start_WT_;
 
         state2state_task::State2StateZDebug latest_state2state_z_debug_;
+        state2state_task::State2StateTopologyRouteRuntime
+                state2state_topology_route_runtime_;
+        state2state_task::State2StateMotionLimits state2state_motion_limits_;
 
         struct GoalInfo {
             Vec3f goal_p{0, 0, 0};
@@ -335,6 +339,28 @@ namespace general_planner {
         }
 
         std::string getLatestState2StateZDebugInfo() const;
+        std::string getLatestState2StateTopologyDebugInfo() const;
+
+        // RETURN_HOME enables this policy; other navigation roles keep local-only.
+        void setState2StateTopologyPolicy(bool enabled);
+        void setState2StateTopologyTaskEpoch(std::uint64_t epoch);
+        /**
+         * Tighten the active state2state dynamics for a task role. Passing a
+         * non-positive value for any field restores the normal navigation
+         * limits. This is used by inspection capture viewpoints only.
+         */
+        void setState2StateMotionLimits(double max_vel,
+                                        double max_acc,
+                                        double max_jerk);
+
+        /** Start a new inspection return corridor at the recorded home pose. */
+        void beginState2StateReturnBreadcrumb(const Vec3f &home);
+        /**
+         * Record an actually flown, locally known-free segment.  This method
+         * is called from the FSM on outward/capture legs, never from a planned
+         * reference path.
+         */
+        void observeState2StateReturnBreadcrumb(const Vec3f &position);
 
         void setSwarmTrajectories(const traj_opt::SwarmTrajectories &trajectories);
         void setSwarmDroneId(int drone_id);

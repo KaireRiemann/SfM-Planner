@@ -134,6 +134,17 @@ namespace rog_map {
 
         void updateOccPointCloud(const PointCloud &input_cloud);
 
+        /**
+         * Clear occupancy inside an oriented thin box (center/normal/width/height/thickness).
+         * Used to mask a previous tunnel face from a prior PCD before the next inspection.
+         * Returns the number of cells reset to unknown.
+         */
+        int forceUnknownInOrientedBox(const Vec3f &center,
+                                      const Vec3f &normal,
+                                      double width,
+                                      double height,
+                                      double thickness);
+
         void writeTimeConsumingToLog(std::ofstream &log_file);
 
         void writeMapInfoToLog(std::ofstream &log_file);
