@@ -194,6 +194,14 @@ Visualization Manager:
             {}
           Queue Size: 100
           Value: true
+        - Class: rviz/MarkerArray
+          Enabled: true
+          Marker Topic: /inspection/viewpoints
+          Name: InspectionViewpoints
+          Namespaces:
+            {}
+          Queue Size: 10
+          Value: true
         - Alpha: 1
           Buffer Length: 1
           Class: rviz/Path

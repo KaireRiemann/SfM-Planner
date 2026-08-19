@@ -27,7 +27,7 @@ Panels:
         - /MarkerArray3/Namespaces1
         - /MarkerArray4/Namespaces1
       Splitter Ratio: 0.5484460592269897
-    Tree Height: 367
+    Tree Height: 948
   - Class: rviz/Selection
     Name: Selection
   - Class: rviz/Tool Properties
@@ -509,13 +509,19 @@ Visualization Manager:
       Unreliable: false
       Value: true
     - Class: rviz/MarkerArray
-      Enabled: true
+      Enabled: false
       Marker Topic: /fsm_node/map_manager/topology
       Name: TopoMap
       Namespaces:
-        incremental_topology_edges: true
-        incremental_topology_nodes: true
-        incremental_topology_status: true
+        {}
+      Queue Size: 100
+      Value: false
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /inspection/viewpoints
+      Name: ViewPoints
+      Namespaces:
+        {}
       Queue Size: 100
       Value: true
   Enabled: true
@@ -537,7 +543,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/XYOrbit
-      Distance: 64.2007064819336
+      Distance: 71.90479278564453
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -545,15 +551,15 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: 65.03085327148438
-        Y: -16.70052719116211
-        Z: -1.3705815945286304e-05
+        X: 68.51678466796875
+        Y: -19.11780548095703
+        Z: -1.256377981917467e-05
       Focal Shape Fixed Size: false
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.6797952651977539
+      Pitch: 1.149795413017273
       Target Frame: world
       Yaw: 4.73678731918335
     Saved: ~

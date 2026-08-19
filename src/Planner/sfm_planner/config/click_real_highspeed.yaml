@@ -353,6 +353,8 @@ inspection_mission:
   face_request_topic: "/inspection/face/request"
   face_result_topic: "/inspection/face/result"
   face_debug_topic: "/inspection/face/debug"
+  # RViz MarkerArray: face outline, numbered viewpoints, view rays and order.
+  viewpoint_debug_topic: "/inspection/viewpoints"
   capture_request_topic: "/inspection/capture/request"
   capture_result_topic: "/inspection/capture/result"
   status_topic: "/inspection/status"
@@ -394,3 +396,6 @@ inspection_mission:
     max_incidence_angle_deg: 60.0
     surface_sample_resolution: 0.4
     min_predicted_coverage: 0.95
+    # Per-photo hover dwell before the camera trigger. Raise to 2.0 when the
+    # camera requires a two-second settling/exposure hold.
+    capture_settle_time_sec: 0.5

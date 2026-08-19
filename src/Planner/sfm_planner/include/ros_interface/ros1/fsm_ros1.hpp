@@ -37,6 +37,7 @@
 #include "nav_msgs/Path.h"
 #include "nav_msgs/Odometry.h"
 #include "sensor_msgs/PointCloud2.h"
+#include "visualization_msgs/MarkerArray.h"
 #include "quadrotor_msgs/PositionCommand.h"
 #include "quadrotor_msgs/PolynomialTrajectory.h"
 #include "quadrotor_msgs/SO3Command.h"
@@ -86,6 +87,7 @@ namespace fsm {
         ros::Subscriber inspection_cloud_sub_;
         ros::Publisher face_request_pub_;
         ros::Publisher face_debug_pub_;
+        ros::Publisher viewpoint_debug_pub_;
         ros::Publisher capture_request_pub_;
         ros::Publisher mission_status_pub_;
         ros::Timer execution_timer_, replan_timer_, cmd_timer_, perception_safety_timer_;
@@ -1038,6 +1040,149 @@ namespace fsm {
             capture_request_pub_.publish(msg);
         }
 
+        void publishInspectionViewpoints(const mission::FaceObservation &face,
+                                         const mission::CoveragePlan &coverage) override {
+            if (!viewpoint_debug_pub_) {
+                return;
+            }
+
+            visualization_msgs::MarkerArray markers;
+            const ros::Time stamp = ros::Time::now();
+            auto initMarker = [&stamp](visualization_msgs::Marker &marker,
+                                       const std::string &name_space,
+                                       const int id,
+                                       const int type) {
+                marker.header.frame_id = "world";
+                marker.header.stamp = stamp;
+                marker.ns = name_space;
+                marker.id = id;
+                marker.type = type;
+                marker.action = visualization_msgs::Marker::ADD;
+                marker.pose.orientation.w = 1.0;
+            };
+            auto toPoint = [](const Eigen::Vector3d &p) {
+                geometry_msgs::Point point;
+                point.x = p.x();
+                point.y = p.y();
+                point.z = p.z();
+                return point;
+            };
+
+            visualization_msgs::Marker clear;
+            clear.header.frame_id = "world";
+            clear.header.stamp = stamp;
+            clear.action = visualization_msgs::Marker::DELETEALL;
+            markers.markers.push_back(clear);
+
+            Eigen::Vector3d normal = face.normal;
+            if (normal.norm() < 1e-6 || !normal.allFinite()) {
+                viewpoint_debug_pub_.publish(markers);
+                return;
+            }
+            normal.normalize();
+            Eigen::Vector3d reference = Eigen::Vector3d::UnitZ();
+            if (std::abs(normal.dot(reference)) > 0.95) {
+                reference = Eigen::Vector3d::UnitY();
+            }
+            const Eigen::Vector3d u = reference.cross(normal).normalized();
+            const Eigen::Vector3d v = normal.cross(u).normalized();
+            const double half_width = 0.5 * std::max(0.0, face.width);
+            const double half_height = 0.5 * std::max(0.0, face.height);
+            const Eigen::Vector3d c0 = face.center - half_width * u - half_height * v;
+            const Eigen::Vector3d c1 = face.center + half_width * u - half_height * v;
+            const Eigen::Vector3d c2 = face.center + half_width * u + half_height * v;
+            const Eigen::Vector3d c3 = face.center - half_width * u + half_height * v;
+
+            visualization_msgs::Marker face_outline;
+            initMarker(face_outline, "inspection_face", 0,
+                       visualization_msgs::Marker::LINE_STRIP);
+            face_outline.scale.x = 0.08;
+            face_outline.color.r = 0.1;
+            face_outline.color.g = 0.8;
+            face_outline.color.b = 1.0;
+            face_outline.color.a = 0.95;
+            face_outline.points = {toPoint(c0), toPoint(c1), toPoint(c2),
+                                   toPoint(c3), toPoint(c0)};
+            markers.markers.push_back(face_outline);
+
+            visualization_msgs::Marker viewpoint_sequence;
+            initMarker(viewpoint_sequence, "inspection_viewpoints", 0,
+                       visualization_msgs::Marker::LINE_STRIP);
+            viewpoint_sequence.scale.x = 0.06;
+            viewpoint_sequence.color.r = 1.0;
+            viewpoint_sequence.color.g = 0.45;
+            viewpoint_sequence.color.b = 0.0;
+            viewpoint_sequence.color.a = 0.9;
+
+            visualization_msgs::Marker viewpoints;
+            initMarker(viewpoints, "inspection_viewpoints", 1,
+                       visualization_msgs::Marker::SPHERE_LIST);
+            viewpoints.scale.x = 0.32;
+            viewpoints.scale.y = 0.32;
+            viewpoints.scale.z = 0.32;
+            viewpoints.color.r = 0.1;
+            viewpoints.color.g = 1.0;
+            viewpoints.color.b = 0.2;
+            viewpoints.color.a = 1.0;
+
+            visualization_msgs::Marker viewing_rays;
+            initMarker(viewing_rays, "inspection_view_rays", 0,
+                       visualization_msgs::Marker::LINE_LIST);
+            viewing_rays.scale.x = 0.025;
+            viewing_rays.color.r = 1.0;
+            viewing_rays.color.g = 1.0;
+            viewing_rays.color.b = 0.1;
+            viewing_rays.color.a = 0.55;
+
+            for (const auto &viewpoint : coverage.ordered_viewpoints) {
+                if (!viewpoint.position.allFinite()) {
+                    continue;
+                }
+                const geometry_msgs::Point p = toPoint(viewpoint.position);
+                viewpoint_sequence.points.push_back(p);
+                viewpoints.points.push_back(p);
+                viewing_rays.points.push_back(p);
+                viewing_rays.points.push_back(toPoint(face.center));
+
+                visualization_msgs::Marker label;
+                initMarker(label, "inspection_viewpoint_labels",
+                           static_cast<int>(viewpoint.id),
+                           visualization_msgs::Marker::TEXT_VIEW_FACING);
+                label.pose.position = p;
+                label.pose.position.z += 0.35;
+                label.scale.z = 0.35;
+                label.color.r = 1.0;
+                label.color.g = 1.0;
+                label.color.b = 1.0;
+                label.color.a = 1.0;
+                label.text = std::to_string(viewpoint.id);
+                markers.markers.push_back(label);
+            }
+            markers.markers.push_back(viewpoint_sequence);
+            markers.markers.push_back(viewpoints);
+            markers.markers.push_back(viewing_rays);
+
+            visualization_msgs::Marker summary;
+            initMarker(summary, "inspection_face", 1,
+                       visualization_msgs::Marker::TEXT_VIEW_FACING);
+            summary.pose.position = toPoint(face.center + 0.15 * normal +
+                                             (half_height + 0.5) * v);
+            summary.scale.z = 0.45;
+            summary.color.r = 0.1;
+            summary.color.g = 0.9;
+            summary.color.b = 1.0;
+            summary.color.a = 1.0;
+            const double face_area = face.area > 0.0 ? face.area : face.width * face.height;
+            summary.text = fmt::format("face {:.2f} x {:.2f} m = {:.2f} m^2 | {} viewpoints | coverage {:.0f}%",
+                                       face.width,
+                                       face.height,
+                                       face_area,
+                                       coverage.ordered_viewpoints.size(),
+                                       100.0 * coverage.predicted_coverage);
+            markers.markers.push_back(summary);
+            viewpoint_debug_pub_.publish(markers);
+        }
+
         void publishMissionStatus(const mission::MissionStatusInfo &status) override {
             if (!mission_status_pub_) {
                 return;
@@ -1609,6 +1754,8 @@ namespace fsm {
                         cfg_.inspection_mission.face_request_topic, 1);
                 face_debug_pub_ = nh_.advertise<sfm_planner::FaceObservation>(
                         cfg_.inspection_mission.face_debug_topic, 1);
+                viewpoint_debug_pub_ = nh_.advertise<visualization_msgs::MarkerArray>(
+                        cfg_.inspection_mission.viewpoint_debug_topic, 1, true);
                 capture_request_pub_ = nh_.advertise<sfm_planner::CaptureRequest>(
                         cfg_.inspection_mission.capture_request_topic, 10);
                 mission_status_pub_ = nh_.advertise<sfm_planner::MissionStatus>(

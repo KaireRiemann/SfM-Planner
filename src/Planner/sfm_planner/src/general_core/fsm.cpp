@@ -1466,6 +1466,10 @@ namespace fsm {
                     publishCaptureRequest(request);
                 },
                 [this](const mission::MissionStatusInfo &status) { publishMissionStatus(status); },
+                [this](const mission::FaceObservation &face,
+                       const mission::CoveragePlan &coverage) {
+                    publishInspectionViewpoints(face, coverage);
+                },
                 [this]() {
                     return planner_ptr_ ? planner_ptr_->getMapManager()
                                         : general_planner::MapManager::Ptr{};

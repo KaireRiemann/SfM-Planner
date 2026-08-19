@@ -20,6 +20,8 @@ public:
     using PublishFaceRequestFn = std::function<void(const FaceDetectionRequest &)>;
     using PublishCaptureRequestFn = std::function<void(const CaptureCommand &)>;
     using PublishStatusFn = std::function<void(const MissionStatusInfo &)>;
+    using PublishViewpointsFn = std::function<void(const FaceObservation &,
+                                                   const CoveragePlan &)>;
     using MapProviderFn = std::function<general_planner::MapManager::Ptr()>;
 
     InspectionMissionPlanner(InspectionMissionConfig config,
@@ -29,6 +31,7 @@ public:
                       PublishFaceRequestFn publish_face_request,
                       PublishCaptureRequestFn publish_capture_request,
                       PublishStatusFn publish_status,
+                      PublishViewpointsFn publish_viewpoints,
                       MapProviderFn map_provider);
 
     void setViewpointPlanner(std::shared_ptr<coverage::FaceViewpointPlanner> planner);
@@ -82,6 +85,7 @@ private:
     PublishFaceRequestFn publish_face_request_;
     PublishCaptureRequestFn publish_capture_request_;
     PublishStatusFn publish_status_;
+    PublishViewpointsFn publish_viewpoints_;
     MapProviderFn map_provider_;
 
     // Recursive: navigation callbacks may re-enter when already at a goal.

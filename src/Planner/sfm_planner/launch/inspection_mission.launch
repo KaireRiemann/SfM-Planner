@@ -10,6 +10,7 @@
     <arg name="external_mock_node" default="false"/>
     <arg name="rviz" default="true"/>
     <arg name="fpv_rviz" default="true"/>
+    <!-- Includes the latched /inspection/viewpoints MarkerArray display. -->
     <arg name="rviz_config" default="$(find perfect_drone_sim)/rviz/top_down.rviz"/>
 
     <node pkg="perfect_drone_sim" type="perfect_drone"

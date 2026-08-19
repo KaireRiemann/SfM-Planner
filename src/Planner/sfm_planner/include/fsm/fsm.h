@@ -491,6 +491,9 @@ namespace fsm {
 
         virtual void publishMissionStatus(const mission::MissionStatusInfo &) {}
 
+        virtual void publishInspectionViewpoints(const mission::FaceObservation &,
+                                                 const mission::CoveragePlan &) {}
+
         void initInspectionMissionPlanner();
     };
 }

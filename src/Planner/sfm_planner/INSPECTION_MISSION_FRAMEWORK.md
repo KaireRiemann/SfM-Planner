@@ -406,6 +406,7 @@ visible(i, j) =
 | `/inspection/start` | `StartInspection.srv` | 输入 | 触发一次任务 |
 | `/inspection/face/request` | `FaceDetectionRequest.msg` | 输出 | 请求外部掌子面识别，并携带任务关联字段 |
 | `/inspection/face/result` | `FaceObservation.msg` | 输入 | 返回掌子面几何和表面点云 |
+| `/inspection/viewpoints` | `visualization_msgs/MarkerArray` | 输出（latched） | 掌子面边界、编号视点、拍摄顺序和视线 |
 | `/inspection/capture/request` | `CaptureRequest.msg` | 输出 | 请求云台在指定视点拍摄 |
 | `/inspection/capture/result` | `CaptureResult.msg` | 输入 | 返回拍照是否成功 |
 | `/inspection/status` | `MissionStatus.msg` | 输出 | 阶段、视点序号、失败原因和版本 |
@@ -613,6 +614,7 @@ inspection_mission:
   mock_capture: true
   use_internal_detector: true
   face_debug_topic: "/inspection/face/debug"
+  viewpoint_debug_topic: "/inspection/viewpoints"
   capture_request_topic: "/inspection/capture/request"
   capture_result_topic: "/inspection/capture/result"
   status_topic: "/inspection/status"
@@ -651,6 +653,8 @@ inspection_mission:
     min_baseline_angle_deg: 8.0
     min_predicted_coverage: 0.95
     max_viewpoints: 60
+    # 每张照片在到达视点后先悬停；例如设为 2.0 即悬停两秒。
+    capture_settle_time_sec: 0.5
 ```
 
 以上数值仅用于说明配置结构，必须通过现场基准测试确定。
@@ -677,6 +681,7 @@ roslaunch sfm_planner inspection_mission.launch
 rosservice call /inspection/start "{}"
 rostopic echo /inspection/status
 rostopic echo /inspection/face/debug
+rostopic echo /inspection/viewpoints
 ```
 
 验收时记录 `/inspection/face/debug` 的 `center`、`normal`、`area`、`confidence`
@@ -684,6 +689,13 @@ rostopic echo /inspection/face/debug
 GO_TO_VIEWPOINT → RETURN_HOME → FINISHED`。该配置的 `mock_capture: true` 会让完整
 任务在视点到达后继续执行并覆盖写回**仿真专用** target 文件；若要反复使用同一初始
 先验，在每轮实验前从版本库还原该文件。
+
+`capture_settle_time_sec` 是每张照片在已到达且航向稳定后、发出相机触发前的悬停时间；
+例如改为 `2.0` 即每张照片悬停两秒。每次执行会输出检测到的宽、高、面积、视点数和
+预测覆盖率；最后一张照片确认后输出 `Capture workflow complete`（从覆盖计划生成到最后
+一张回执的耗时），返回 Home 后再输出 `Mission timing`（包含接近、拍摄和返航的全任务耗时）。
+`/inspection/viewpoints` 为 latched `MarkerArray`，在 RViz 中添加同名 MarkerArray 后可查看
+掌子面轮廓、绿色视点、橙色拍摄顺序线、黄色视线和编号。
 
 若要验证“到航点后生成视点”但暂时没有掌子面识别器，设置 `navigation_only: false`、`skip_face_detection: true`、`trigger_from_2d_goal: true`。任务会把 2D `/goal` 作为接近航点，读取 `mission_target.yaml` 的 `face_center`、`face_normal` 和 `change_region.width/height` 生成先验视点；该路径不提交新的 `MissionTarget`。
 

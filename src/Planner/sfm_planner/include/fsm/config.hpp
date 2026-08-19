@@ -443,6 +443,9 @@ namespace fsm {
             loader.LoadParam("inspection_mission/face_debug_topic",
                              inspection_mission.face_debug_topic,
                              string("/inspection/face/debug"));
+            loader.LoadParam("inspection_mission/viewpoint_debug_topic",
+                             inspection_mission.viewpoint_debug_topic,
+                             string("/inspection/viewpoints"));
             loader.LoadParam("inspection_mission/capture_request_topic",
                              inspection_mission.capture_request_topic,
                              string("/inspection/capture/request"));

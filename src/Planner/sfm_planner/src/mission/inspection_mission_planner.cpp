@@ -52,12 +52,14 @@ void InspectionMissionPlanner::setCallbacks(
         PublishFaceRequestFn publish_face_request,
         PublishCaptureRequestFn publish_capture_request,
         PublishStatusFn publish_status,
+        PublishViewpointsFn publish_viewpoints,
         MapProviderFn map_provider) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     submit_nav_ = std::move(submit_nav);
     publish_face_request_ = std::move(publish_face_request);
     publish_capture_request_ = std::move(publish_capture_request);
     publish_status_ = std::move(publish_status);
+    publish_viewpoints_ = std::move(publish_viewpoints);
     map_provider_ = std::move(map_provider);
 }
 
@@ -328,6 +330,7 @@ bool InspectionMissionPlanner::start(const MissionPose &home,
     ctx_.has_pending_target = false;
     ctx_.viewpoints.clear();
     ctx_.viewpoint_index = 0;
+    ctx_.mission_start_time_sec = steadyNowSec();
 
     MissionPose approach;
     approach.position = ctx_.active_target.nav_goal;
@@ -382,6 +385,14 @@ void InspectionMissionPlanner::tick() {
             request.request_id = ctx_.next_request_id++;
             request.viewpoint = ctx_.viewpoints[ctx_.viewpoint_index];
             ctx_.active_capture_request_id = request.request_id;
+            if (ctx_.first_capture_request_time_sec < 0.0) {
+                ctx_.first_capture_request_time_sec = steadyNowSec();
+            }
+            fmt::print(fg(fmt::color::cyan),
+                       " -- [Inspection] Capture {}/{}: hover dwell {:.2f}s complete; trigger camera.\n",
+                       ctx_.viewpoint_index + 1,
+                       ctx_.viewpoints.size(),
+                       settle);
             if (publish_capture_request_) {
                 publish_capture_request_(request);
             }
@@ -495,9 +506,26 @@ bool InspectionMissionPlanner::planViewsFromPending(const MissionPose &robot) {
 
     ctx_.viewpoints = coverage.ordered_viewpoints;
     ctx_.viewpoint_index = 0;
-    publishStatusLocked(fmt::format("views={};coverage={:.2f};{}",
+    ctx_.capture_workflow_start_time_sec = steadyNowSec();
+    const double face_area = face.area > 0.0 ? face.area : face.width * face.height;
+    fmt::print(fg(fmt::color::cyan),
+               " -- [Inspection] Detected face: {:.2f}m x {:.2f}m = {:.2f}m^2; "
+               "viewpoints={}, predicted_coverage={:.2f}, capture_dwell={:.2f}s.\n",
+               face.width,
+               face.height,
+               face_area,
+               ctx_.viewpoints.size(),
+               coverage.predicted_coverage,
+               std::max(0.0, cfg_.capture_settle_time_sec));
+    if (publish_viewpoints_) {
+        publish_viewpoints_(face, coverage);
+    }
+    publishStatusLocked(fmt::format("views={};coverage={:.2f};face={:.2f}x{:.2f}m;area={:.2f}m2;{}",
                                     ctx_.viewpoints.size(),
                                     coverage.predicted_coverage,
+                                    face.width,
+                                    face.height,
+                                    face_area,
                                     coverage.detail));
     return dispatchCurrentViewpoint();
 }
@@ -604,6 +632,28 @@ void InspectionMissionPlanner::onNavigationSucceeded(NavigationRole role,
             } else if (cfg_.navigation_only) {
                 setState(InspectionState::FINISHED, "navigation_only_complete");
             } else {
+                const double now = steadyNowSec();
+                const double mission_elapsed = ctx_.mission_start_time_sec >= 0.0
+                                                       ? now - ctx_.mission_start_time_sec
+                                                       : 0.0;
+                const double capture_elapsed =
+                        ctx_.capture_workflow_start_time_sec >= 0.0 &&
+                                ctx_.capture_workflow_finish_time_sec >= 0.0
+                                ? ctx_.capture_workflow_finish_time_sec -
+                                          ctx_.capture_workflow_start_time_sec
+                                : 0.0;
+                const double plan_to_first_capture =
+                        ctx_.capture_workflow_start_time_sec >= 0.0 &&
+                                ctx_.first_capture_request_time_sec >= 0.0
+                                ? ctx_.first_capture_request_time_sec -
+                                          ctx_.capture_workflow_start_time_sec
+                                : 0.0;
+                fmt::print(fg(fmt::color::cyan),
+                           " -- [Inspection] Mission timing: total={:.2f}s, "
+                           "capture_workflow={:.2f}s, plan_to_first_capture={:.2f}s.\n",
+                           mission_elapsed,
+                           capture_elapsed,
+                           plan_to_first_capture);
                 setState(InspectionState::FINISHED, "mission_complete");
             }
             return;
@@ -694,7 +744,19 @@ void InspectionMissionPlanner::onCaptureResult(const CaptureResult &result) {
             return;
         }
     }
-    returnHome();
+    ctx_.capture_workflow_finish_time_sec = steadyNowSec();
+    const double capture_elapsed = ctx_.capture_workflow_start_time_sec >= 0.0
+                                           ? ctx_.capture_workflow_finish_time_sec -
+                                                     ctx_.capture_workflow_start_time_sec
+                                           : 0.0;
+    fmt::print(fg(fmt::color::cyan),
+               " -- [Inspection] Capture workflow complete: photos={}, elapsed={:.2f}s "
+               "(dwell {:.2f}s/photo).\n",
+               ctx_.viewpoints.size(),
+               capture_elapsed,
+               std::max(0.0, cfg_.capture_settle_time_sec));
+    returnHome(fmt::format("capture_complete;photos={};capture_elapsed_sec={:.2f}",
+                           ctx_.viewpoints.size(), capture_elapsed));
 }
 
 }  // namespace mission

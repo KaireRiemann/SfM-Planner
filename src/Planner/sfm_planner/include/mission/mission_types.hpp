@@ -184,6 +184,15 @@ struct MissionContext {
     uint32_t active_face_request_id{0};
     uint32_t active_capture_request_id{0};
 
+    // Monotonic-clock timestamps for the portion of the mission that starts
+    // when the coverage plan is accepted and ends at the final successful
+    // camera acknowledgement. They are runtime diagnostics only and are not
+    // persisted with MissionTarget.
+    double mission_start_time_sec{-1.0};
+    double capture_workflow_start_time_sec{-1.0};
+    double first_capture_request_time_sec{-1.0};
+    double capture_workflow_finish_time_sec{-1.0};
+
     std::string mission_id;
     std::string failure_reason;
 };
@@ -228,6 +237,9 @@ struct InspectionMissionConfig {
     // intentionally different from face_result_topic to avoid feeding the
     // observation back through the external-result subscriber.
     std::string face_debug_topic{"/inspection/face/debug"};
+    // Latched MarkerArray containing the detected face boundary, generated
+    // capture viewpoints, viewing rays, and their execution order.
+    std::string viewpoint_debug_topic{"/inspection/viewpoints"};
     std::string capture_request_topic{"/inspection/capture/request"};
     std::string capture_result_topic{"/inspection/capture/result"};
     std::string status_topic{"/inspection/status"};

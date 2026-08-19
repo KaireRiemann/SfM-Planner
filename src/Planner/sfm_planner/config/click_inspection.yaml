@@ -495,6 +495,8 @@ inspection_mission:
   face_request_topic: "/inspection/face/request"
   face_result_topic: "/inspection/face/result"
   face_debug_topic: "/inspection/face/debug"
+  # RViz MarkerArray: face outline, numbered viewpoints, view rays and order.
+  viewpoint_debug_topic: "/inspection/viewpoints"
   capture_request_topic: "/inspection/capture/request"
   capture_result_topic: "/inspection/capture/result"
   status_topic: "/inspection/status"
@@ -550,6 +552,7 @@ inspection_mission:
     # cave1's ~12 x 8 m face needs more than the old implicit 24-view cap
     # when every sample must be observed twice.
     max_viewpoints: 60
-    # Capture only after the vehicle reaches a settled hover.  The next
-    # state2state leg is submitted after this dwell and capture acknowledgement.
-    capture_settle_time_sec: 0.5
+    # Per-photo hover dwell before the camera trigger. Set this to 2.0 for a
+    # two-second exposure/settling hold; the next leg starts only after the
+    # dwell and the capture acknowledgement.
+    capture_settle_time_sec: 2.0
