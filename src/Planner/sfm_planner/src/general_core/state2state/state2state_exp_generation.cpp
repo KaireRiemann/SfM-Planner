@@ -332,9 +332,13 @@ namespace general_planner {
         services.z_debug = State2StateZDebug{};
         services.z_debug.goal_z = services.goal_p.z();
         services.z_debug.robot_z = services.robot_state.p.z();
-        services.z_debug.exp_mode = services.cfg.plain_traj_en
-                                               ? "plain"
-                                               : (services.cfg.esdf_traj_en ? "esdf" : "corridor");
+        services.z_debug.exp_mode = services.motion_limits.capture_profile
+                                            ? "capture"
+                                            : (services.cfg.plain_traj_en
+                                                       ? "plain"
+                                                       : (services.cfg.esdf_traj_en
+                                                                  ? "esdf"
+                                                                  : "corridor"));
 
         StatePVAJ pos_init_state, pos_fina_state;
         PolytopeVec sfc;
@@ -353,9 +357,17 @@ namespace general_planner {
         const double replan_process_start_WT = services.ros_ptr->getSimTime();
         double replan_process_start_TT, replan_state_TT;
         const bool planning_from_rest = last_exp_traj_info.empty();
-        const bool use_plain_exp_traj = services.cfg.plain_traj_en;
-        const bool use_esdf_exp_traj = services.cfg.esdf_traj_en && !use_plain_exp_traj;
+        // A capture viewpoint is a short local motion between static camera
+        // poses. Always use its dedicated corridor optimizer, even if a
+        // launch file enables an ESDF/plain transit backend for navigation.
+        const bool use_capture_profile = services.motion_limits.capture_profile;
+        const bool use_plain_exp_traj = !use_capture_profile && services.cfg.plain_traj_en;
+        const bool use_esdf_exp_traj = !use_capture_profile &&
+                                       services.cfg.esdf_traj_en && !use_plain_exp_traj;
         const bool use_distance_field_exp_traj = use_plain_exp_traj || use_esdf_exp_traj;
+        const auto &active_exp_cfg = use_capture_profile
+                                             ? services.cfg.capture_traj_cfg
+                                             : services.cfg.exp_traj_cfg;
         const auto capped_motion_limit = [](const double configured,
                                             const double override_limit) {
             return std::isfinite(override_limit) && override_limit > 0.0
@@ -363,11 +375,11 @@ namespace general_planner {
                    : configured;
         };
         const double plan_max_vel = capped_motion_limit(
-                services.cfg.exp_traj_cfg.max_vel, services.motion_limits.max_vel);
+                active_exp_cfg.max_vel, services.motion_limits.max_vel);
         const double plan_max_acc = capped_motion_limit(
-                services.cfg.exp_traj_cfg.max_acc, services.motion_limits.max_acc);
+                active_exp_cfg.max_acc, services.motion_limits.max_acc);
         const double plan_max_jerk = capped_motion_limit(
-                services.cfg.exp_traj_cfg.max_jerk, services.motion_limits.max_jerk);
+                active_exp_cfg.max_jerk, services.motion_limits.max_jerk);
         const bool reuse_command_guide_prefix =
                 !planning_from_rest && services.cfg.state2state_replan_use_command_guide;
 
@@ -746,7 +758,14 @@ namespace general_planner {
             z_floor_anchor = std::numeric_limits<double>::quiet_NaN();
         }
         double z_floor_reference = z_floor_anchor;
-        if (std::isfinite(z_floor_anchor)) {
+        if (use_capture_profile) {
+            // Viewpoints encode their intended height. A navigation cruise
+            // floor is semantically wrong here and dominated sub-metre moves
+            // with a large hidden altitude penalty. The dedicated capture
+            // cost manager receives NaN below, disabling this term entirely.
+            z_floor_anchor = std::numeric_limits<double>::quiet_NaN();
+            z_floor_reference = std::numeric_limits<double>::quiet_NaN();
+        } else if (std::isfinite(z_floor_anchor)) {
             // Do not let a previously drifted start lower the altitude target.
             // A lower guide point is admitted only when the map says that the
             // mission-height probe at the same XY is occupied, i.e. the route
@@ -775,14 +794,15 @@ namespace general_planner {
                 }
             }
         }
-        services.z_debug.z_floor_enabled = !use_distance_field_exp_traj &&
+        services.z_debug.z_floor_enabled = !use_capture_profile &&
+                                            !use_distance_field_exp_traj &&
                                             std::isfinite(z_floor_reference) &&
-                                            services.cfg.exp_traj_cfg.guide_z_tube_radius > 0.0 &&
-                                            services.cfg.exp_traj_cfg.activePenaltyWeights().guide_z_tube > 0.0;
+                                            active_exp_cfg.guide_z_tube_radius > 0.0 &&
+                                            active_exp_cfg.activePenaltyWeights().guide_z_tube > 0.0;
         services.z_debug.z_floor_anchor = z_floor_anchor;
         services.z_debug.z_floor_reference = z_floor_reference;
         services.z_debug.z_floor_tolerance =
-                std::max(0.0, services.cfg.exp_traj_cfg.guide_z_tube_radius);
+                std::max(0.0, active_exp_cfg.guide_z_tube_radius);
 
         bool temp_ret;
         Trajectory out_traj;
@@ -827,13 +847,20 @@ namespace general_planner {
                 return FAILED;
             }
         } else {
-            services.traj_manager->exp()->setGuideZFloorReference(z_floor_reference);
-            temp_ret = services.traj_manager->exp()->optimize(pos_init_state,
-                                                      pos_fina_state,
-                                                      guide_path,
-                                                      guide_stamp,
-                                                      sfc,
-                                                      out_traj);
+            const auto optimizer = use_capture_profile
+                                           ? services.traj_manager->capture()
+                                           : services.traj_manager->exp();
+            if (!optimizer) {
+                services.ros_ptr->warn(" -- [GeneralPlanner] State2state optimizer is unavailable.");
+                return FAILED;
+            }
+            optimizer->setGuideZFloorReference(z_floor_reference);
+            temp_ret = optimizer->optimize(pos_init_state,
+                                           pos_fina_state,
+                                           guide_path,
+                                           guide_stamp,
+                                           sfc,
+                                           out_traj);
         }
         services.time_consuming[EXP_TRAJ_OPT] = t_exp_opt.stop();
         if (use_esdf_exp_traj) {
@@ -849,7 +876,14 @@ namespace general_planner {
         } else {
             VecDf init_ts;
             vec_Vec3f init_ps;
-            services.traj_manager->exp()->getInitValue(init_ts, init_ps);
+            const auto optimizer = use_capture_profile
+                                           ? services.traj_manager->capture()
+                                           : services.traj_manager->exp();
+            if (!optimizer) {
+                services.ros_ptr->warn(" -- [GeneralPlanner] State2state optimizer is unavailable.");
+                return FAILED;
+            }
+            optimizer->getInitValue(init_ts, init_ps);
             services.latest_replan.setExpCondition(init_ts, init_ps, pos_init_state, pos_fina_state, sfc);
         }
         if (!temp_ret) {

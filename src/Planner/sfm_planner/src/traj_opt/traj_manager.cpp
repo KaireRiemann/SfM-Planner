@@ -2552,6 +2552,7 @@ double ExpTrajOpt::optimize(Trajectory &traj, double rel_cost_tol)
               << ", quality=" << opt_vars_.quality.summary()
               << ", guide_excess=" << opt_vars_.guide_integral_violation
               << ", guide_cost_sample=" << opt_vars_.guide_path_cost_log
+              << ", guide_z_lower_violation=" << opt_vars_.guide_z_tube_violation
               << ", guide_max_abs_gt=" << opt_vars_.guide_path_max_abs_time_grad
               << ", guide_oob_samples=" << opt_vars_.guide_path_out_of_time_range_samples
               << ", pieces=" << opt_vars_.piece_num
@@ -6135,6 +6136,7 @@ bool PlainTrajOpt::optimize(const StatePVAJ &headPVAJ,
 }
 
 TrajManager::TrajManager(const traj_opt::Config &exp_cfg,
+                         const traj_opt::Config &capture_cfg,
                          const traj_opt::Config &esdf_cfg,
                          const traj_opt::Config &plain_cfg,
                          const traj_opt::Config &backup_cfg,
@@ -6144,6 +6146,7 @@ TrajManager::TrajManager(const traj_opt::Config &exp_cfg,
                          const general_planner::MapManager::Ptr &map_manager)
 {
   exp_traj_opt_ = std::make_shared<ExpTrajOpt>(exp_cfg, ros_ptr);
+  capture_traj_opt_ = std::make_shared<ExpTrajOpt>(capture_cfg, ros_ptr);
   esdf_traj_opt_ = std::make_shared<ESDFTrajOpt>(esdf_cfg, ros_ptr);
   esdf_traj_opt_->setMapManager(map_manager);
   esdf_traj_opt_->setSafeDistance(esdf_safe_distance);
@@ -6218,6 +6221,10 @@ void TrajManager::setSwarmConfig(const SwarmPenaltyConfig &config)
   {
     exp_traj_opt_->setSwarmConfig(config);
   }
+  if (capture_traj_opt_)
+  {
+    capture_traj_opt_->setSwarmConfig(config);
+  }
   if (esdf_traj_opt_)
   {
     esdf_traj_opt_->setSwarmConfig(config);
@@ -6234,6 +6241,10 @@ void TrajManager::setSwarmTrajectories(const SwarmTrajectoriesConstPtr &trajecto
   {
     exp_traj_opt_->setSwarmTrajectories(trajectories);
   }
+  if (capture_traj_opt_)
+  {
+    capture_traj_opt_->setSwarmTrajectories(trajectories);
+  }
   if (esdf_traj_opt_)
   {
     esdf_traj_opt_->setSwarmTrajectories(trajectories);
@@ -6249,6 +6260,10 @@ void TrajManager::setSwarmCurrentWallTime(double wall_time)
   if (exp_traj_opt_)
   {
     exp_traj_opt_->setSwarmCurrentWallTime(wall_time);
+  }
+  if (capture_traj_opt_)
+  {
+    capture_traj_opt_->setSwarmCurrentWallTime(wall_time);
   }
   if (esdf_traj_opt_)
   {

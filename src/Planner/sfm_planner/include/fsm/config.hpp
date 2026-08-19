@@ -206,7 +206,7 @@ namespace fsm {
         double state2state_inspection_retry_backoff_initial_sec{0.15};
         double state2state_inspection_retry_backoff_max_sec{1.0};
         // Capture viewpoints are camera poses, not high-speed transit goals.
-        // Non-positive values retain the normal state2state navigation profile.
+        // Non-positive values retain the capture_traj profile's own limits.
         double state2state_inspection_capture_max_vel{0.0};
         double state2state_inspection_capture_max_acc{0.0};
         double state2state_inspection_capture_max_jerk{0.0};

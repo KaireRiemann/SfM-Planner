@@ -27,14 +27,13 @@ Panels:
         - /MarkerArray3/Namespaces1
         - /MarkerArray4/Namespaces1
       Splitter Ratio: 0.5484460592269897
-    Tree Height: 948
+    Tree Height: 367
   - Class: rviz/Selection
     Name: Selection
   - Class: rviz/Tool Properties
     Expanded:
       - /Interact1
       - /2D Nav Goal1
-      - /3D Nav Goal1
     Name: Tool Properties
     Splitter Ratio: 0.5886790156364441
   - Class: rviz/Views
@@ -264,8 +263,7 @@ Visualization Manager:
           Marker Topic: /fsm_node/visualization/goal
           Name: Goal
           Namespaces:
-            goal: true
-            goal_line: true
+            {}
           Queue Size: 100
           Value: true
         - Class: rviz/MarkerArray
@@ -309,8 +307,7 @@ Visualization Manager:
           Marker Topic: /fsm_node/visualization/exp_traj
           Name: ExpTraj
           Namespaces:
-            exp_traj: true
-            exp_traj_waypoints: true
+            {}
           Queue Size: 100
           Value: true
         - Class: rviz/MarkerArray
@@ -318,9 +315,7 @@ Visualization Manager:
           Marker Topic: /fsm_node/visualization/backup_traj
           Name: BackupTraj
           Namespaces:
-            backup_traj: true
-            backup_traj_start: true
-            backup_traj_waypoints: true
+            {}
           Queue Size: 100
           Value: true
         - Class: rviz/MarkerArray
@@ -380,7 +375,7 @@ Visualization Manager:
           Marker Topic: /fsm_node/visualization/yaw_traj
           Name: Yaw
           Namespaces:
-            yaw_traj: true
+            {}
           Queue Size: 100
           Value: true
       Enabled: true
@@ -542,7 +537,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/XYOrbit
-      Distance: 159.38975524902344
+      Distance: 64.2007064819336
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -550,17 +545,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: -31.861154556274414
-        Y: 8.863162994384766
-        Z: -1.5140843970584683e-05
+        X: 65.03085327148438
+        Y: -16.70052719116211
+        Z: -1.3705815945286304e-05
       Focal Shape Fixed Size: false
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.0247955322265625
+      Pitch: 0.6797952651977539
       Target Frame: world
-      Yaw: 3.1617889404296875
+      Yaw: 4.73678731918335
     Saved: ~
 Window Geometry:
   Displays:

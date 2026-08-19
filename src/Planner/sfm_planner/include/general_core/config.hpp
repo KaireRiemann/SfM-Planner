@@ -43,7 +43,7 @@ namespace general_planner {
             YAW_TO_GOAL = 2
         };
 
-        traj_opt::Config exp_traj_cfg, back_traj_cfg, esdf_traj_cfg, plain_traj_cfg;
+        traj_opt::Config exp_traj_cfg, capture_traj_cfg, back_traj_cfg, esdf_traj_cfg, plain_traj_cfg;
 
         // Bool Params
         bool visualization_en{true};
@@ -427,6 +427,16 @@ namespace general_planner {
         Config(const std::string & cfg_path) {
             yaml_loader::YamlLoader loader(cfg_path);
             exp_traj_cfg = traj_opt::Config(cfg_path, "exp_traj");
+            capture_traj_cfg = traj_opt::Config(cfg_path, "capture_traj");
+            // Capture is optional in non-inspection launch files. Retain a
+            // safe independent optimizer instead of an unset profile.
+            if (capture_traj_cfg.penna_t < 0.0 ||
+                capture_traj_cfg.penna_pos < 0.0 ||
+                capture_traj_cfg.penna_vel < 0.0 ||
+                capture_traj_cfg.penna_acc < 0.0 ||
+                capture_traj_cfg.penna_jerk < 0.0) {
+                capture_traj_cfg = exp_traj_cfg;
+            }
             back_traj_cfg = traj_opt::Config(cfg_path, "backup_traj");
             esdf_traj_cfg = traj_opt::Config(cfg_path, "esdf_traj");
             plain_traj_cfg = traj_opt::Config(cfg_path, "plain_traj");

@@ -1042,8 +1042,14 @@ namespace fsm {
                     return;
                 }
                 const bool inspection_navigation_active =
-                        inspectionMissionActive() &&
-                        active_navigation_role_ != mission::NavigationRole::EXTERNAL_CLICK;
+                        (inspectionMissionActive() &&
+                         active_navigation_role_ != mission::NavigationRole::EXTERNAL_CLICK) ||
+                        // A RETURN_HOME global guide can outlive a terminal
+                        // mission callback by one FSM tick. Keep its retry
+                        // policy bounded by time/map updates rather than
+                        // treating it as an external click and burning the
+                        // raw attempt budget at 100 Hz.
+                        active_navigation_role_ == mission::NavigationRole::HOME;
                 if (inspection_navigation_active &&
                     state2state_plan_from_rest_retry_after_ > 0.0 &&
                     ros_ptr_->getSimTime() < state2state_plan_from_rest_retry_after_) {
@@ -1240,8 +1246,9 @@ namespace fsm {
                             ++state2state_plan_from_rest_fail_count_;
                             const int failure_limit = cfg_.state2state_plan_from_rest_max_failures;
                             const bool inspection_navigation_failed =
-                                    inspection_mission_ && inspection_mission_->active() &&
-                                    active_navigation_role_ != mission::NavigationRole::EXTERNAL_CLICK;
+                                    (inspection_mission_ && inspection_mission_->active() &&
+                                     active_navigation_role_ != mission::NavigationRole::EXTERNAL_CLICK) ||
+                                    active_navigation_role_ == mission::NavigationRole::HOME;
                             const double now = ros_ptr_->getSimTime();
                             if (state2state_plan_from_rest_fail_count_ == 1) {
                                 state2state_plan_from_rest_fail_start_time_ = now;
@@ -1322,7 +1329,8 @@ namespace fsm {
                                                                   static_cast<int>(
                                                                           cfg_.state2state_clear_goal_on_plan_failure)),
                                                       retcode);
-                                if (inspection_navigation_failed) {
+                                if (inspection_navigation_failed && inspection_mission_ &&
+                                    inspection_mission_->active()) {
                                     inspection_mission_->onNavigationFailed(
                                             active_navigation_role_,
                                             fmt::format("navigation_plan_failed:{}",
@@ -1331,6 +1339,14 @@ namespace fsm {
                                     // non-home legs return home, while a failed
                                     // home leg becomes terminal.
                                     resetState2StatePlanFromRestFailure();
+                                    break;
+                                }
+                                if (inspection_navigation_failed) {
+                                    // The mission may already have emitted a terminal status,
+                                    // but a queued HOME goal is still safety-critical. Do not
+                                    // silently clear it through the external-click failure path.
+                                    state2state_plan_from_rest_retry_after_ =
+                                            now + std::max(0.1, retry_delay);
                                     break;
                                 }
                                 if (cfg_.state2state_clear_goal_on_plan_failure) {
@@ -1568,15 +1584,17 @@ namespace fsm {
             return;
         }
         if (role != mission::NavigationRole::CAPTURE_VIEWPOINT) {
+            planner_ptr_->setState2StateCaptureProfile(false);
             planner_ptr_->setState2StateMotionLimits(0.0, 0.0, 0.0);
             return;
         }
+        planner_ptr_->setState2StateCaptureProfile(true);
         planner_ptr_->setState2StateMotionLimits(
                 cfg_.state2state_inspection_capture_max_vel,
                 cfg_.state2state_inspection_capture_max_acc,
                 cfg_.state2state_inspection_capture_max_jerk);
         fmt::print(fg(fmt::color::cyan),
-                   " -- [Inspection] CAPTURE_VIEWPOINT uses motion limits v/a/j=({:.2f}/{:.2f}/{:.2f}).\n",
+                   " -- [Inspection] CAPTURE_VIEWPOINT uses dedicated local profile; optional v/a/j cap=({:.2f}/{:.2f}/{:.2f}).\n",
                    cfg_.state2state_inspection_capture_max_vel,
                    cfg_.state2state_inspection_capture_max_acc,
                    cfg_.state2state_inspection_capture_max_jerk);

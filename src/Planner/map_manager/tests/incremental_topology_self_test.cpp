@@ -105,6 +105,33 @@ int main() {
     ok &= expect(stats.rebuilt_region_count == 4 && stats.revision == 4,
                  "incremental revision statistics are inconsistent");
 
+    // Return-home must remain globally connected through actual executed
+    // motion even when the sparse skeleton has not covered that corridor.
+    // The query deliberately knows only the recorded odom anchors, so a
+    // success here proves A* used the mission history layer rather than a
+    // fabricated direct ray or skeleton shortcut.
+    IncrementalTopologyGraph history_graph(config);
+    const Vec3f home(0.5, 0.5, 0.5);
+    const Vec3f current(5.5, 0.5, 0.5);
+    IncrementalTopologyGraph::Query history_query;
+    history_query.traversable = [](const Vec3f &point) {
+        constexpr double tolerance = 1.0e-6;
+        return (point - Vec3f(0.5, 0.5, 0.5)).norm() < tolerance ||
+               (point - Vec3f(2.5, 0.5, 0.5)).norm() < tolerance ||
+               (point - Vec3f(4.5, 0.5, 0.5)).norm() < tolerance ||
+               (point - Vec3f(5.5, 0.5, 0.5)).norm() < tolerance;
+    };
+    history_graph.resetExecutedPathHistory(home);
+    history_graph.appendExecutedPathHistory(
+        {home, Vec3f(2.5, 0.5, 0.5), Vec3f(4.5, 0.5, 0.5), current});
+    path.clear();
+    ok &= expect(history_graph.findPath(current, home, history_query, path),
+                 "executed odometry chain must guarantee a return A* path");
+    const auto history_stats = history_graph.stats();
+    ok &= expect(history_stats.executed_history_node_count == 4 &&
+                     history_stats.executed_history_edge_count == 3,
+                 "executed odometry history graph statistics are inconsistent");
+
     // A narrow inflated flight-height band is valid for quasi-2D
     // state2state planning, but a 3D minimum-clearance ray test necessarily
     // sees the floor/ceiling first. Planar topology must keep those bounds as

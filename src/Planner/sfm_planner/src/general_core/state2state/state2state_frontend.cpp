@@ -405,10 +405,11 @@ namespace state2state_task {
                 if (!reaches_goal || raw_route.size() < 2) {
                     route.last_result = "TOPO_HOME_NOT_CONNECTED";
                     services.ros_ptr->warn(
-                        " -- [GeneralPlanner] Topology A* does not prove a complete home route: start=[{:.2f},{:.2f},{:.2f}] goal=[{:.2f},{:.2f},{:.2f}] nodes={}.",
+                        " -- [GeneralPlanner] Topology/history A* does not prove a complete home route: start=[{:.2f},{:.2f},{:.2f}] goal=[{:.2f},{:.2f},{:.2f}] nodes={} history_nodes={}.",
                         temp_start_point.x(), temp_start_point.y(), temp_start_point.z(),
                         goal.x(), goal.y(), goal.z(),
-                        snapshot->graph.size());
+                        snapshot->graph.size(),
+                        snapshot->executed_history_nodes.size());
                     return false;
                 }
 
@@ -427,12 +428,13 @@ namespace state2state_task {
                 route.last_result = "TOPO_HOME_ROUTE_READY";
                 services.ros_ptr->vizGoalPath(route.raw_topology_route);
                 services.ros_ptr->info(
-                    " -- [GeneralPlanner] Topology route ready: id={}, points={}, length={:.2f}m, reaches_goal={}, result={}.",
+                    " -- [GeneralPlanner] Topology/history A* route ready: id={}, points={}, length={:.2f}m, reaches_goal={}, result={}, history_nodes={}.",
                     route.route_id,
                     route.raw_topology_route.size(),
                     route.arc_length.empty() ? 0.0 : route.arc_length.back(),
                     static_cast<int>(route.reaches_goal),
-                    route.last_result);
+                    route.last_result,
+                    snapshot->executed_history_nodes.size());
                 return true;
             };
 
@@ -495,21 +497,13 @@ namespace state2state_task {
                 return true;
             };
 
-            // A topology route is a cache, not an authority.  Keep using its
-            // locally revalidated prefix within the query interval, then
-            // replace it once asynchronous construction has published a newer
-            // graph snapshot.  Breadcrumbs are not invalidated here: their
-            // next local prefix is validated on every replan and remains the
-            // conservative fallback when the graph loses connectivity.
-            if (route.valid && route.source == GlobalRouteSource::TOPOLOGY) {
-                const auto latest_snapshot =
-                    services.map_manager->topologySearchSnapshot();
-                if (latest_snapshot && latest_snapshot->revision > route.topo_revision &&
-                    (!std::isfinite(route.last_query_time) ||
-                     now - route.last_query_time >= query_interval)) {
-                    clearRoute("TOPO_SNAPSHOT_ADVANCED", true);
-                }
-            }
+            // RETURN_HOME uses one global route as a stable long-range guide.
+            // A freshly published topology snapshot is not a reason to replace
+            // it: the rolling planner validates the selected local prefix on
+            // every tick, while rebuilding global A* for each snapshot can
+            // consume the entire replan slot. Requery only after an explicit
+            // route-invalidating event below (goal/world/task change, failed
+            // projection, or a blocked prefix that cannot be locally repaired).
 
             if (!route.valid && !queryGlobalRoute(false) && !buildBreadcrumbRoute()) {
                 return false;
@@ -536,8 +530,12 @@ namespace state2state_task {
                              2.0 * services.cfg.resolution);
             };
             if (!acquireRouteProjection()) {
+                const GlobalRouteSource previous_source = route.source;
                 clearRoute("TOPO_ROUTE_DEVIATED", false);
-                if (!queryGlobalRoute(true) || !acquireRouteProjection()) {
+                const bool rebuilt = queryGlobalRoute(true) ||
+                    (previous_source == GlobalRouteSource::BREADCRUMB &&
+                     buildBreadcrumbRoute());
+                if (!rebuilt || !acquireRouteProjection()) {
                     route.last_result = "TOPO_ROUTE_REJOIN_FAILED";
                     return false;
                 }
@@ -709,13 +707,28 @@ namespace state2state_task {
                 return false;
             };
 
-            if (blocked && repairToRouteSuffix()) {
+            // A return-history route is a full global route, not a weak
+            // progress hint. Try the same bounded local rejoin used by real
+            // planner before discarding it; boundary-limited prefixes may
+            // also need this when the rolling map moved since the last tick.
+            if ((blocked || route.source == GlobalRouteSource::BREADCRUMB) &&
+                repairToRouteSuffix()) {
                 return true;
             }
-            clearRoute(blocked ? "TOPO_PREFIX_BLOCKED" : "TOPO_PREFIX_OUT_OF_LOCAL_WINDOW",
+            const GlobalRouteSource rejected_source = route.source;
+            const std::string rejected_reason = blocked
+                ? "TOPO_PREFIX_BLOCKED" : "TOPO_PREFIX_OUT_OF_LOCAL_WINDOW";
+            services.ros_ptr->warn(
+                " -- [GeneralPlanner] Reject local prefix from {}: blocked={} boundary_limited={}; retain return history and wait for a safe rejoin.",
+                toString(rejected_source), static_cast<int>(blocked),
+                static_cast<int>(boundary_limited));
+            clearRoute(rejected_reason,
                        false);
             if (queryGlobalRoute(true)) {
                 route.last_result = "TOPO_REQUERY_READY_LOCAL_FALLBACK";
+            } else if (rejected_source == GlobalRouteSource::BREADCRUMB &&
+                       buildBreadcrumbRoute()) {
+                route.last_result = "BREADCRUMB_RETAINED_WAIT_LOCAL_REJOIN";
             }
             return false;
         };

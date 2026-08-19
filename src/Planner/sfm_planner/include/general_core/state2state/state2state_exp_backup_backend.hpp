@@ -67,10 +67,10 @@ struct State2StateZDebug {
     double z_floor_min_margin{0.0};
 };
 
-// Optional role-specific limits for a state2state task.  Zero means the
-// normal navigation profile from Config; a valid override can only tighten
-// those limits and is used for slow capture-to-capture viewpoint motion.
+// Optional role-specific limits for a state2state task. Capture uses its own
+// optimizer/configuration and may additionally tighten its nominal limits.
 struct State2StateMotionLimits {
+    bool capture_profile{false};
     double max_vel{0.0};
     double max_acc{0.0};
     double max_jerk{0.0};

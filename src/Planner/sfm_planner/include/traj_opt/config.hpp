@@ -175,6 +175,7 @@ namespace traj_opt {
         Config(const std::string & cfg_path, string ns) {
             yaml_loader::YamlLoader loader(cfg_path);
             const bool is_exp_traj = ns == "exp_traj";
+            const bool is_capture_traj = ns == "capture_traj";
             if (ns.empty()) {
                 ns = "/";
             }
@@ -303,6 +304,20 @@ namespace traj_opt {
             loader.LoadParam("traj_opt/boundary/max_acc_thr", max_acc_thr, -1.0);
             loader.LoadParam("traj_opt/boundary/min_acc_thr", min_acc_thr, -1.0);
             loader.LoadParam("traj_opt/boundary/penna_margin", penna_margin, 0.05);
+            // Capture legs are a separate flight regime: they may use tighter
+            // body limits without changing the shared navigation boundary.
+            // Keep every other profile backward compatible with the legacy
+            // traj_opt/boundary block.
+            if (is_capture_traj) {
+                loader.LoadParam("traj_opt" + ns + "boundary/max_vel", max_vel, max_vel);
+                loader.LoadParam("traj_opt" + ns + "boundary/max_acc", max_acc, max_acc);
+                loader.LoadParam("traj_opt" + ns + "boundary/max_jerk", max_jerk, max_jerk);
+                loader.LoadParam("traj_opt" + ns + "boundary/max_omg", max_omg, max_omg);
+                loader.LoadParam("traj_opt" + ns + "boundary/max_tilt", max_tilt, max_tilt);
+                loader.LoadParam("traj_opt" + ns + "boundary/max_acc_thr", max_acc_thr, max_acc_thr);
+                loader.LoadParam("traj_opt" + ns + "boundary/min_acc_thr", min_acc_thr, min_acc_thr);
+                loader.LoadParam("traj_opt" + ns + "boundary/penna_margin", penna_margin, penna_margin);
+            }
 
             loader.LoadParam("traj_opt" + ns + "penna_scale", penna_scale, -1.0);
             loader.LoadParam("traj_opt" + ns + "penna_t", penna_t, -1.0);

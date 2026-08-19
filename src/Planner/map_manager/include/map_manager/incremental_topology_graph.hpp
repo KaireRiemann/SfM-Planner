@@ -179,6 +179,9 @@ public:
     struct SearchSnapshot {
         Config config;
         std::unordered_map<NodeId, SearchNode> graph;
+        /** Node ids belonging to the mission's executed-motion backbone. */
+        std::unordered_set<NodeId> executed_history_nodes;
+        NodeId executed_history_tail_id{0};
         std::uint64_t revision{0};
     };
     using SearchSnapshotPtr = std::shared_ptr<const SearchSnapshot>;
@@ -194,6 +197,8 @@ public:
         std::size_t last_sampled_center_count{0};
         std::size_t last_traversable_center_count{0};
         std::size_t last_clearance_rejected_count{0};
+        std::size_t executed_history_node_count{0};
+        std::size_t executed_history_edge_count{0};
         std::uint64_t revision{0};
     };
 
@@ -229,6 +234,16 @@ public:
      * bubbles along the flown return corridor.
      */
     void observeVerifiedPath(const rog_map::vec_Vec3f &path);
+
+    /**
+     * Start a mission-scoped executed-motion graph rooted at home.  Unlike a
+     * sparse skeleton, every edge in this layer is an already flown segment
+     * which passed the inflated known-free validation in the planner.
+     */
+    void resetExecutedPathHistory(const rog_map::Vec3f &home);
+
+    /** Append verified executed segments to the mission history graph. */
+    void appendExecutedPathHistory(const rog_map::vec_Vec3f &path);
 
     /** Rebuild at most max_regions (or the configured budget when zero). */
     std::size_t update(const TopologyMapView &map_view,
@@ -349,6 +364,10 @@ private:
     std::unordered_map<RegionKey, rog_map::vec_Vec3f, RegionKeyHash>
         dirty_evidence_seeds_;
     std::unordered_set<RegionKey, RegionKeyHash> observed_route_regions_;
+    /** Persistent mission layer equivalent to real planner historical odom. */
+    NodeMap executed_history_nodes_;
+    NodeId executed_history_tail_id_{0};
+    bool executed_history_active_{false};
     NodeId next_node_id_{1};
     std::uint64_t revision_{0};
     std::size_t rebuilt_region_count_{0};

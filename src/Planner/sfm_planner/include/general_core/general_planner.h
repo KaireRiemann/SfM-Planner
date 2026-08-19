@@ -349,6 +349,7 @@ namespace general_planner {
          * non-positive value for any field restores the normal navigation
          * limits. This is used by inspection capture viewpoints only.
          */
+        void setState2StateCaptureProfile(bool enabled);
         void setState2StateMotionLimits(double max_vel,
                                         double max_acc,
                                         double max_jerk);

@@ -263,6 +263,60 @@ traj_opt:
     penna_omg: 5.0e+6
     penna_thr: 2.0e+6
 
+  # Dedicated short-range camera-pose profile. This is intentionally not a
+  # collection of runtime v/a/j overrides on exp_traj: it creates an
+  # independent ExpTrajOpt and cost-manager state for CAPTURE_VIEWPOINT.
+  # In particular, capture has no global navigation z-floor and no cross-leg
+  # warm-start cache. Collision safety remains the local SFC constructed from
+  # the current static map.
+  capture_traj:
+    pos_constraint_type: 1
+    block_energy_cost: false
+    opt_accuracy: 5.0e-6
+    # Use the regular dense solve for a one-/few-piece rest-to-rest motion.
+    # The navigation fast path is tuned for long transit corridors.
+    lbfgs_fast_en: false
+    lbfgs_mem_size: 64
+    lbfgs_step_bound_en: true
+    lbfgs_time_ratio_min: 0.5
+    lbfgs_time_ratio_max: 2.0
+    lbfgs_warm_start_en: false
+    # The guide is first retimed against these bounds, then retains a small
+    # numerical margin before L-BFGS starts.
+    guide_initial_time_scale: 1.20
+    init_profile_vel_ratio: 0.55
+    init_duration_scale: 1.35
+    terminal_vel_ratio: 0.0
+    integral_reso: 15
+    convex_hull_en: false
+    smooth_eps: 0.01
+    # Balanced dense penalties for short static moves. The SFC is the safety
+    # authority; these costs shape smooth, dynamically gentle trajectories.
+    penna_t: 1.0e+4
+    penna_pos: 2.0e+6
+    penna_vel: 5.0e+4
+    penna_acc: 1.0e+5
+    penna_jerk: 1.0e+5
+    penna_attract: 5.0e+2
+    penna_guide_path: 0.0
+    penna_guide_z_tube: 0.0
+    guide_z_tube_radius: 0.0
+    guide_path_tube_radius: 0.0
+    guide_path_z_tube_radius: 0.0
+    guide_path_huber_delta: 0.25
+    guide_path_time_gradient_en: false
+    penna_omg: 1.0e+5
+    penna_thr: 2.0e+5
+    boundary:
+      max_vel: 1.5
+      max_acc: 1.5
+      max_jerk: 6.0
+      max_omg: 3.5
+      max_tilt: 1.05
+      max_acc_thr: 22.0
+      min_acc_thr: 6.0
+      penna_margin: 0.05
+
   backup_traj:
     uniform_time_en: true
     pos_constraint_type: 1
@@ -376,9 +430,9 @@ rog_map:
   # Intensity filter for input point cloud. If the point intensity is less than this value,
   # it will be ignored (to avoid noise like dusk).
   intensity_thresh: -10
-  # The temporal downsample rate for input point cloud.
-  #  e.g. if set to k, the point cloud will be downsampled to 1/k.
-  point_filt_num: 1
+  # Subsample every input cloud by two. The 0.15 m map resolution remains
+  # well supported while keeping raycasting below the incoming LiDAR rate.
+  point_filt_num: 2
 
   # Probabilistc update
   raycasting:
@@ -388,9 +442,14 @@ rog_map:
     # ROG contains OCCUPIED and UNKNOWN only and cannot supply KNOWN_FREE.
     enable: true
     batch_update_size: 1
-    local_update_box: [ 100,100,5 ]
-    # The range of raycasting [m].
-    ray_range: [0.5, 100 ]
+    # This is a full box (not a half extent).  It covers the 15 m local
+    # planning horizon plus margin without raycasting the whole 50 m map on
+    # every cloud. Long-range return connectivity is preserved by topology
+    # and executed-history routes, not by a single local-map update.
+    local_update_box: [ 36,36,8 ]
+    # The range of raycasting [m]. Keep it aligned with the local update box;
+    # points farther away cannot improve the current local collision map.
+    ray_range: [0.5, 35 ]
 
     p_min: 0.12
     p_miss: 0.49

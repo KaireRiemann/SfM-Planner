@@ -44,6 +44,9 @@
 #include <visualization_msgs/MarkerArray.h>
 #include <general_utils/color_msg_utils.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <cstdint>
+#include <mutex>
+#include <utility>
 namespace rog_map {
     using namespace general_utils;
 
@@ -65,6 +68,7 @@ namespace rog_map {
         struct ROSCallback {
             ros::Subscriber odom_sub, cloud_sub;
             int unfinished_frame_cnt{0};
+            std::uint64_t coalesced_frame_cnt{0};
             Pose pc_pose;
             PointCloud pc;
             ros::Timer update_timer;
@@ -108,12 +112,15 @@ namespace rog_map {
             }
             PointCloud tmp_pc;
             pcl::fromROSMsg(*cloud_msg, tmp_pc);
-            rc_.updete_lock.lock();
-            rc_.pc = tmp_pc;
-            rc_.pc_pose = std::make_pair(robot_state_.p, robot_state_.q);
-            rc_.unfinished_frame_cnt++;
-            map_empty_ = false;
-            rc_.updete_lock.unlock();
+            {
+                std::lock_guard<mutex> lock(rc_.updete_lock);
+                // Latest-frame fusion is deliberate: queuing all frames makes
+                // the occupancy map stale when the sensor outruns raycasting.
+                rc_.pc = std::move(tmp_pc);
+                rc_.pc_pose = std::make_pair(robot_state_.p, robot_state_.q);
+                ++rc_.unfinished_frame_cnt;
+                map_empty_ = false;
+            }
         }
 
         void updateCallback(const ros::TimerEvent& event) {
@@ -127,23 +134,40 @@ namespace rog_map {
                 }
                 return;
             }
-            if (rc_.unfinished_frame_cnt == 0) {
-                return;
+            PointCloud temp_pc;
+            Pose temp_pose;
+            int pending_frame_cnt{0};
+            std::uint64_t coalesced_frame_cnt{0};
+            {
+                std::lock_guard<mutex> lock(rc_.updete_lock);
+                pending_frame_cnt = rc_.unfinished_frame_cnt;
+                if (pending_frame_cnt == 0) {
+                    return;
+                }
+                temp_pc = std::move(rc_.pc);
+                temp_pose = rc_.pc_pose;
+                rc_.unfinished_frame_cnt = 0;
+                if (pending_frame_cnt > 1) {
+                    rc_.coalesced_frame_cnt +=
+                        static_cast<std::uint64_t>(pending_frame_cnt - 1);
+                }
+                coalesced_frame_cnt = rc_.coalesced_frame_cnt;
             }
 
-            if (rc_.unfinished_frame_cnt > 1) {
-                std::cout << YELLOW <<
-                    " -- [ROG WARN] Unfinished frame cnt > 1, the map may not work in real-time" << RESET
-                    << std::endl;
+            if (pending_frame_cnt > 1) {
+                static double last_overload_warn_t = -1.0;
+                const double now = ros::Time::now().toSec();
+                if (last_overload_warn_t < 0.0 || now - last_overload_warn_t >= 1.0) {
+                    std::cout << YELLOW
+                              << " -- [ROG WARN] Map fusion is behind: coalesced "
+                              << (pending_frame_cnt - 1)
+                              << " stale cloud frame(s); total_coalesced="
+                              << coalesced_frame_cnt
+                              << ". Keeping the newest frame for a current local map."
+                              << RESET << std::endl;
+                    last_overload_warn_t = now;
+                }
             }
-            static PointCloud temp_pc;
-            static Pose temp_pose;
-
-            rc_.updete_lock.lock();
-            temp_pc = rc_.pc;
-            temp_pose = rc_.pc_pose;
-            rc_.unfinished_frame_cnt = 0;
-            rc_.updete_lock.unlock();
 
             updateProbMap(temp_pc, temp_pose);
 

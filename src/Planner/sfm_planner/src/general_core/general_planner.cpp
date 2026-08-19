@@ -166,28 +166,53 @@ namespace general_planner {
         state2state_topology_route_runtime_.setTaskEpoch(epoch);
     }
 
+    void GeneralPlanner::setState2StateCaptureProfile(const bool enabled) {
+        if (state2state_motion_limits_.capture_profile == enabled) {
+            return;
+        }
+        state2state_motion_limits_ = state2state_task::State2StateMotionLimits{};
+        state2state_motion_limits_.capture_profile = enabled;
+        if (traj_manager_) {
+            const auto optimizer = enabled ? traj_manager_->capture()
+                                           : traj_manager_->exp();
+            if (optimizer) {
+                optimizer->setMotionLimits(0.0, 0.0, 0.0);
+            }
+        }
+    }
+
     void GeneralPlanner::setState2StateMotionLimits(const double max_vel,
                                                      const double max_acc,
                                                      const double max_jerk) {
         const bool valid_override = std::isfinite(max_vel) && std::isfinite(max_acc) &&
                                     std::isfinite(max_jerk) &&
                                     max_vel > 0.0 && max_acc > 0.0 && max_jerk > 0.0;
+        const auto &profile_cfg = state2state_motion_limits_.capture_profile
+                                          ? cfg_.capture_traj_cfg
+                                          : cfg_.exp_traj_cfg;
         if (valid_override) {
             state2state_motion_limits_.max_vel =
-                    std::min(cfg_.exp_traj_cfg.max_vel, max_vel);
+                    std::min(profile_cfg.max_vel, max_vel);
             state2state_motion_limits_.max_acc =
-                    std::min(cfg_.exp_traj_cfg.max_acc, max_acc);
+                    std::min(profile_cfg.max_acc, max_acc);
             state2state_motion_limits_.max_jerk =
-                    std::min(cfg_.exp_traj_cfg.max_jerk, max_jerk);
+                    std::min(profile_cfg.max_jerk, max_jerk);
         } else {
+            const bool capture_profile = state2state_motion_limits_.capture_profile;
             state2state_motion_limits_ = state2state_task::State2StateMotionLimits{};
+            state2state_motion_limits_.capture_profile = capture_profile;
         }
 
-        if (traj_manager_ && traj_manager_->exp()) {
-            traj_manager_->exp()->setMotionLimits(
-                    state2state_motion_limits_.max_vel,
-                    state2state_motion_limits_.max_acc,
-                    state2state_motion_limits_.max_jerk);
+        if (traj_manager_) {
+            const auto optimizer = state2state_motion_limits_.capture_profile
+                                           ? traj_manager_->capture()
+                                           : traj_manager_->exp();
+            if (optimizer) {
+                optimizer->setMotionLimits(
+                        state2state_motion_limits_.max_vel,
+                        state2state_motion_limits_.max_acc,
+                        state2state_motion_limits_.max_jerk);
+            }
         }
     }
 
@@ -196,6 +221,9 @@ namespace general_planner {
         auto &runtime = state2state_topology_route_runtime_;
         resetGlobalTopologyRoute(runtime.route, "BREADCRUMB_MISSION_RESET");
         resetVerifiedBreadcrumb(runtime.breadcrumb, home);
+        if (map_manager_) {
+            map_manager_->resetExecutedTopologyHistory(home);
+        }
         if (runtime.breadcrumb.active) {
             ros_ptr_->info(
                 " -- [GeneralPlanner] Return breadcrumb anchored at home=[{:.2f},{:.2f},{:.2f}].",
@@ -278,6 +306,10 @@ namespace general_planner {
             verified_path.push_back(next);
             previous = next;
         }
+        // Mirror real planner's historical odometry graph: a segment enters
+        // the global return graph only after it was actually flown and passed
+        // the local inflated known-free validation above.
+        map_manager_->appendExecutedTopologyHistory(verified_path);
         map_manager_->observeVerifiedTopologyPath(verified_path);
     }
 
@@ -372,6 +404,7 @@ namespace general_planner {
         tracking_perching_manager_ = std::make_unique<TrackingPerchingTransitionManager>();
         tracking_to_perching_initializer_ = std::make_unique<TrackingToPerchingInitializer>();
         traj_manager_ = std::make_shared<traj_opt::TrajManager>(cfg_.exp_traj_cfg,
+                                                                cfg_.capture_traj_cfg,
                                                                 cfg_.esdf_traj_cfg,
                                                                 cfg_.plain_traj_cfg,
                                                                 cfg_.back_traj_cfg,

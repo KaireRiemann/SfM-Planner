@@ -960,6 +960,7 @@ public:
   using Ptr = std::shared_ptr<TrajManager>;
 
   TrajManager(const traj_opt::Config &exp_cfg,
+              const traj_opt::Config &capture_cfg,
               const traj_opt::Config &esdf_cfg,
               const traj_opt::Config &plain_cfg,
               const traj_opt::Config &backup_cfg,
@@ -969,6 +970,9 @@ public:
               const general_planner::MapManager::Ptr &map_manager);
 
   ExpTrajOpt::Ptr exp() const { return exp_traj_opt_; }
+  // Capture owns a separate ExpTrajOpt/cost-manager state. It never reuses
+  // high-speed navigation warm-start data or its altitude objective.
+  ExpTrajOpt::Ptr capture() const { return capture_traj_opt_; }
   ESDFTrajOpt::Ptr esdf() const { return esdf_traj_opt_; }
   PlainTrajOpt::Ptr plain() const { return plain_traj_opt_; }
   BackupTrajOpt::Ptr backup() const { return backup_traj_opt_; }
@@ -985,6 +989,7 @@ public:
 
 private:
   ExpTrajOpt::Ptr exp_traj_opt_;
+  ExpTrajOpt::Ptr capture_traj_opt_;
   ESDFTrajOpt::Ptr esdf_traj_opt_;
   PlainTrajOpt::Ptr plain_traj_opt_;
   BackupTrajOpt::Ptr backup_traj_opt_;

@@ -102,6 +102,9 @@ void IncrementalTopologyGraph::configure(const Config &config) {
         regions_.clear();
         initialized_regions_.clear();
         dense_node_index_.clear();
+        executed_history_nodes_.clear();
+        executed_history_tail_id_ = 0;
+        executed_history_active_ = false;
         next_node_id_ = 1;
         revision_ = 0;
         rebuilt_region_count_ = 0;
@@ -470,6 +473,87 @@ void IncrementalTopologyGraph::observeVerifiedPath(
                 }
             }
         }
+    }
+}
+
+void IncrementalTopologyGraph::resetExecutedPathHistory(
+    const rog_map::Vec3f &home) {
+    if (!home.allFinite()) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> update_lock(update_mutex_);
+        std::unique_lock<std::shared_mutex> lock(graph_mutex_);
+        if (!config_.enabled) {
+            return;
+        }
+        executed_history_nodes_.clear();
+        executed_history_tail_id_ = next_node_id_++;
+        NodeRecord root;
+        root.node.id = executed_history_tail_id_;
+        root.node.position = home;
+        root.node.clearance = 0.0;
+        root.node.revision = revision_ + 1;
+        root.node.last_observed_revision = revision_ + 1;
+        root.node.state = NodeState::HISTORICAL;
+        root.region = regionOf(home);
+        executed_history_nodes_.emplace(root.node.id, std::move(root));
+        executed_history_active_ = true;
+        ++revision_;
+    }
+    publishSearchSnapshot();
+}
+
+void IncrementalTopologyGraph::appendExecutedPathHistory(
+    const rog_map::vec_Vec3f &path) {
+    if (path.empty()) {
+        return;
+    }
+
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> update_lock(update_mutex_);
+        std::unique_lock<std::shared_mutex> lock(graph_mutex_);
+        if (!config_.enabled || !executed_history_active_) {
+            return;
+        }
+        auto tail = executed_history_nodes_.find(executed_history_tail_id_);
+        if (tail == executed_history_nodes_.end()) {
+            executed_history_active_ = false;
+            executed_history_tail_id_ = 0;
+            return;
+        }
+        for (const rog_map::Vec3f &point : path) {
+            if (!point.allFinite()) {
+                continue;
+            }
+            const double distance = (point - tail->second.node.position).norm();
+            if (!std::isfinite(distance) || distance <= 1.0e-4) {
+                continue;
+            }
+            const NodeId id = next_node_id_++;
+            NodeRecord next;
+            next.node.id = id;
+            next.node.position = point;
+            next.node.clearance = 0.0;
+            next.node.revision = revision_ + 1;
+            next.node.last_observed_revision = revision_ + 1;
+            next.node.state = NodeState::HISTORICAL;
+            next.region = regionOf(point);
+            tail->second.neighbors[id] = distance;
+            next.neighbors[tail->first] = distance;
+            auto inserted = executed_history_nodes_.emplace(id, std::move(next));
+            tail = inserted.first;
+            executed_history_tail_id_ = id;
+            changed = true;
+        }
+        if (changed) {
+            ++revision_;
+        }
+    }
+    if (changed) {
+        publishSearchSnapshot();
     }
 }
 
@@ -1618,11 +1702,19 @@ void IncrementalTopologyGraph::publishSearchSnapshot() {
         std::shared_lock<std::shared_mutex> lock(graph_mutex_);
         next->config = config_;
         next->revision = revision_;
-        next->graph.reserve(nodes_.size());
+        next->executed_history_tail_id = executed_history_tail_id_;
+        next->graph.reserve(nodes_.size() + executed_history_nodes_.size());
         for (const auto &entry : nodes_) {
             next->graph.emplace(entry.first,
                                 SearchNode{entry.second.node,
                                            entry.second.neighbors});
+        }
+        next->executed_history_nodes.reserve(executed_history_nodes_.size());
+        for (const auto &entry : executed_history_nodes_) {
+            next->graph.emplace(entry.first,
+                                SearchNode{entry.second.node,
+                                           entry.second.neighbors});
+            next->executed_history_nodes.insert(entry.first);
         }
     }
     std::atomic_store_explicit(
@@ -1732,6 +1824,13 @@ IncrementalTopologyGraph::Stats IncrementalTopologyGraph::stats() const {
             output.edge_count += entry.second.neighbors.size();
         }
         output.edge_count /= 2U;
+        output.executed_history_node_count = executed_history_nodes_.size();
+        for (const auto &entry : executed_history_nodes_) {
+            output.executed_history_edge_count += entry.second.neighbors.size();
+        }
+        output.executed_history_edge_count /= 2U;
+        output.node_count += output.executed_history_node_count;
+        output.edge_count += output.executed_history_edge_count;
         output.revision = revision_;
         output.rebuilt_region_count = rebuilt_region_count_;
         output.empty_region_count = empty_region_count_;
@@ -1766,11 +1865,33 @@ bool IncrementalTopologyGraph::findPath(
     double attach_radius) const {
     path.clear();
     if (!active() || !snapshot || !start.allFinite() || !goal.allFinite() ||
-        !map_view.isTraversable(start) || !map_view.isTraversable(goal)) {
+        !map_view.isTraversable(start)) {
         return false;
     }
     const auto &graph = snapshot->graph;
     const Config &query_config = snapshot->config;
+    const auto isExecutedHistoryGoalAnchor = [&](const NodeId id,
+                                                 const rog_map::Vec3f &position) {
+        return snapshot->executed_history_nodes.count(id) != 0U &&
+               (position - goal).norm() <= query_config.edge_sample_spacing;
+    };
+    bool goal_has_executed_history_anchor = false;
+    for (const NodeId id : snapshot->executed_history_nodes) {
+        const auto node = graph.find(id);
+        if (node != graph.end() &&
+            (node->second.node.position - goal).norm() <=
+                query_config.edge_sample_spacing) {
+            goal_has_executed_history_anchor = true;
+            break;
+        }
+    }
+    // A Home point that has slid outside the current map can still be the
+    // exact root of an executed-motion chain. The local frontend validates
+    // the prefix before flight; rejecting this anchor here would turn a
+    // known return route into a false global disconnection.
+    if (!map_view.isTraversable(goal) && !goal_has_executed_history_anchor) {
+        return false;
+    }
     attach_radius = attach_radius > 0.0
         ? attach_radius : query_config.connection_radius;
     if ((goal - start).norm() <= query_config.edge_sample_spacing) {
@@ -1822,13 +1943,36 @@ bool IncrementalTopologyGraph::findPath(
             start_candidates.push_back(nearest_start[i]);
         }
     }
+    // The latest historical odom node is the real planner's guaranteed
+    // return attachment. Reserve it explicitly so dense local skeleton nodes
+    // cannot consume the bounded start-candidate budget and hide the chain.
+    if (snapshot->executed_history_tail_id != 0U) {
+        const auto tail = graph.find(snapshot->executed_history_tail_id);
+        if (tail != graph.end()) {
+            const double tail_distance = (tail->second.node.position - start).norm();
+            const bool already_attached = std::any_of(
+                start_candidates.begin(), start_candidates.end(),
+                [&](const std::pair<double, NodeId> &candidate) {
+                    return candidate.second == snapshot->executed_history_tail_id;
+                });
+            if (!already_attached && tail_distance <= attach_radius &&
+                lineTraversable(start, tail->second.node.position, map_view,
+                                query_config.edge_sample_spacing)) {
+                start_candidates.insert(start_candidates.begin(),
+                                        {tail_distance,
+                                         snapshot->executed_history_tail_id});
+            }
+        }
+    }
     for (std::size_t i = 0;
          i < nearest_goal.size() && i < attachment_checks &&
          goal_links.size() < query_config.max_neighbors; ++i) {
         const auto node = graph.find(nearest_goal[i].second);
         if (node != graph.end() &&
-            lineTraversable(node->second.node.position, goal, map_view,
-                            query_config.edge_sample_spacing)) {
+            (isExecutedHistoryGoalAnchor(nearest_goal[i].second,
+                                         node->second.node.position) ||
+             lineTraversable(node->second.node.position, goal, map_view,
+                             query_config.edge_sample_spacing))) {
             goal_links.emplace(nearest_goal[i].second, nearest_goal[i].first);
         }
     }

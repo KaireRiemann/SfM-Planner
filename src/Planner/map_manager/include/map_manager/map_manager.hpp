@@ -287,6 +287,22 @@ public:
         }
     }
 
+    /** Reset the mission-scoped executed-motion return backbone at Home. */
+    void resetExecutedTopologyHistory(const rog_map::Vec3f &home) const
+    {
+        if (topology_graph_) {
+            topology_graph_->resetExecutedPathHistory(home);
+        }
+    }
+
+    /** Add only already verified executed segments to the return backbone. */
+    void appendExecutedTopologyHistory(const rog_map::vec_Vec3f &path) const
+    {
+        if (topology_graph_) {
+            topology_graph_->appendExecutedPathHistory(path);
+        }
+    }
+
     IncrementalTopologyGraph::Snapshot topologySnapshot() const
     {
         return topology_graph_ ? topology_graph_->snapshot()
