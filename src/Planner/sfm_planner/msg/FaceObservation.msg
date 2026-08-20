@@ -5,8 +5,12 @@ uint32 request_id
 bool valid
 geometry_msgs/Point center
 geometry_msgs/Vector3 normal
+geometry_msgs/Vector3 tangent_u
+geometry_msgs/Vector3 tangent_v
 float64 width
 float64 height
 float64 area
 float64 confidence
+bool extent_complete
+string extent_detail
 sensor_msgs/PointCloud2 surface_cloud

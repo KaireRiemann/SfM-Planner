@@ -135,6 +135,30 @@ target_include_directories(state2state_topology_route_self_test PRIVATE
         ${Eigen3_INCLUDE_DIRS}
 )
 
+add_executable(face_extent_self_test
+        Tests/face_extent_self_test.cpp
+)
+add_dependencies(face_extent_self_test
+        ${${PROJECT_NAME}_EXPORTED_TARGETS}
+        ${catkin_EXPORTED_TARGETS}
+)
+target_link_libraries(face_extent_self_test
+        sfm_planner_core
+        ${THIRD_PARTY}
+)
+
+add_executable(inspection_face_recenter_self_test
+        Tests/inspection_face_recenter_self_test.cpp
+)
+add_dependencies(inspection_face_recenter_self_test
+        ${${PROJECT_NAME}_EXPORTED_TARGETS}
+        ${catkin_EXPORTED_TARGETS}
+)
+target_link_libraries(inspection_face_recenter_self_test
+        sfm_planner_core
+        ${THIRD_PARTY}
+)
+
 install(TARGETS fsm_node sfm_planner_core inspection_mock_node
         ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
         LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}

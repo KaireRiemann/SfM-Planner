@@ -3,7 +3,6 @@
 #include <pcl/ModelCoefficients.h>
 #include <pcl/common/centroid.h>
 #include <pcl/common/common.h>
-#include <pcl/common/pca.h>
 #include <pcl/filters/extract_indices.h>
 #include <pcl/filters/statistical_outlier_removal.h>
 #include <pcl/filters/voxel_grid.h>
@@ -52,6 +51,23 @@ double planeResidualScore(const pcl::PointCloud<pcl::PointXYZ>::Ptr &cloud,
         sum += d;
     }
     return sum / static_cast<double>(cloud->size());
+}
+
+void buildFaceFrame(const Eigen::Vector3d &normal_in,
+                    Eigen::Vector3d &normal,
+                    Eigen::Vector3d &u,
+                    Eigen::Vector3d &v) {
+    normal = normal_in;
+    if (normal.norm() < 1e-6) {
+        normal = -Eigen::Vector3d::UnitX();
+    }
+    normal.normalize();
+    Eigen::Vector3d up = Eigen::Vector3d::UnitZ();
+    if (std::abs(normal.dot(up)) > 0.95) {
+        up = Eigen::Vector3d::UnitY();
+    }
+    u = (up.cross(normal)).normalized();
+    v = normal.cross(u).normalized();
 }
 
 }  // namespace
@@ -213,37 +229,76 @@ bool FaceDetector::extractBestCandidate(
             }
         }
 
-        pcl::PCA<pcl::PointXYZ> pca;
-        pca.setInputCloud(plane_cloud);
-        const Eigen::Matrix3f ev = pca.getEigenVectors();
-        const Eigen::Vector3f mean = pca.getMean().head<3>();
+        // RANSAC only establishes a reliable local normal.  The old code used
+        // its inliers as the entire face, which reports high coverage for a
+        // small flat patch on a much larger rough/curved tunnel end.  Grow the
+        // support along that normal from the pre-outlier-filtered ROI, then
+        // derive the rectangle from all accepted end-face points.  In
+        // particular, SOR is allowed to trim sparse boundary points for the
+        // RANSAC seed but must not shrink the measured face extent.
+        Eigen::Vector3d plane_normal(coeffs.values[0], coeffs.values[1], coeffs.values[2]);
+        const double plane_normal_norm = plane_normal.norm();
+        if (plane_normal_norm < 1e-6) {
+            continue;
+        }
+        plane_normal /= plane_normal_norm;
+        const double plane_offset = coeffs.values[3] / plane_normal_norm;
+        pcl::PointCloud<pcl::PointXYZ>::Ptr support_cloud(
+                new pcl::PointCloud<pcl::PointXYZ>);
+        support_cloud->reserve(filtered->size());
+        const double support_distance = std::max(cfg_.ransac_dist,
+                                                 cfg_.support_plane_distance);
+        for (const auto &pt : filtered->points) {
+            const Eigen::Vector3d p(pt.x, pt.y, pt.z);
+            if (std::abs(plane_normal.dot(p) + plane_offset) <= support_distance) {
+                support_cloud->push_back(pt);
+            }
+        }
+        if (static_cast<int>(support_cloud->size()) < cfg_.min_points) {
+            continue;
+        }
+
+        Eigen::Vector3d frame_normal;
+        Eigen::Vector3d face_u;
+        Eigen::Vector3d face_v;
+        buildFaceFrame(normal, frame_normal, face_u, face_v);
         double min_u = std::numeric_limits<double>::infinity();
         double max_u = -std::numeric_limits<double>::infinity();
         double min_v = std::numeric_limits<double>::infinity();
         double max_v = -std::numeric_limits<double>::infinity();
-        const Eigen::Vector3f e0 = ev.col(0);
-        const Eigen::Vector3f e1 = ev.col(1);
-        for (const auto &pt : plane_cloud->points) {
-            const Eigen::Vector3f d = Eigen::Vector3f(pt.x, pt.y, pt.z) - mean;
-            const double pu = d.dot(e0);
-            const double pv = d.dot(e1);
+        bool roi_edge_touched = false;
+        const double lateral_edge = std::max(
+                0.0, cfg_.lateral_half_width - std::max(0.0, cfg_.roi_edge_margin));
+        const double vertical_edge = std::max(
+                0.0, cfg_.vertical_half_height - std::max(0.0, cfg_.roi_edge_margin));
+        for (const auto &pt : support_cloud->points) {
+            const Eigen::Vector3d p(pt.x, pt.y, pt.z);
+            const Eigen::Vector3d relative = p - center;
+            const double pu = relative.dot(face_u);
+            const double pv = relative.dot(face_v);
             min_u = std::min(min_u, pu);
             max_u = std::max(max_u, pu);
             min_v = std::min(min_v, pv);
             max_v = std::max(max_v, pv);
+            const Eigen::Vector3d robot_relative = p - robot_position;
+            if (std::abs(robot_relative.dot(u)) >= lateral_edge ||
+                std::abs(robot_relative.dot(v)) >= vertical_edge) {
+                roi_edge_touched = true;
+            }
         }
-        const double width = std::max(0.0, max_u - min_u);
-        const double height = std::max(0.0, max_v - min_v);
+        const double padding = std::max(0.0, cfg_.extent_padding);
+        const double width = std::max(0.0, max_u - min_u) + 2.0 * padding;
+        const double height = std::max(0.0, max_v - min_v) + 2.0 * padding;
         const double area = width * height;
         if (area < cfg_.min_area) {
             continue;
         }
 
-        // Convex-hull-like center: midpoint of PCA extents projected on plane.
+        // Center of the conservative, world-up-aligned rectangle.  The same
+        // frame is carried forward to coverage planning and RViz.
         const Eigen::Vector3d center_uv =
-                mean.cast<double>() +
-                0.5 * (min_u + max_u) * e0.cast<double>() +
-                0.5 * (min_v + max_v) * e1.cast<double>();
+                center + 0.5 * (min_u + max_u) * face_u +
+                0.5 * (min_v + max_v) * face_v;
         if (prior_center && cfg_.prior_center_tolerance > 0.0 &&
             (center_uv - *prior_center).norm() > cfg_.prior_center_tolerance) {
             continue;
@@ -254,7 +309,7 @@ bool FaceDetector::extractBestCandidate(
                 Eigen::Vector4f(coeffs.values[0], coeffs.values[1], coeffs.values[2],
                                 coeffs.values[3]));
         const double density =
-                static_cast<double>(plane_cloud->size()) / std::max(1e-3, area);
+                static_cast<double>(support_cloud->size()) / std::max(1e-3, area);
         const double forward = (center_uv - robot_position).dot(dir);
         const double confidence = std::clamp(
                 0.35 * alignment + 0.25 * std::min(1.0, area / std::max(1.0, cfg_.min_area)) +
@@ -266,16 +321,26 @@ bool FaceDetector::extractBestCandidate(
             continue;
         }
 
-        const double score = confidence * 2.0 + alignment + 0.05 * area + 0.01 * forward;
+        // A complete candidate always beats an otherwise comparable ROI-cropped
+        // one.  If every candidate is cropped we still return the best one so
+        // the mission can emit `face_extent_clipped` rather than timing out.
+        const double score = confidence * 2.0 + alignment + 0.05 * area +
+                             0.01 * forward + (roi_edge_touched ? 0.0 : 10.0);
         if (score > best_score) {
             best_score = score;
             best.center = center_uv;
-            best.normal = normal;
+            best.normal = frame_normal;
+            best.tangent_u = face_u;
+            best.tangent_v = face_v;
             best.width = width;
             best.height = height;
             best.area = area;
             best.confidence = confidence;
-            best.cloud = plane_cloud;
+            best.extent_complete = !roi_edge_touched;
+            best.extent_detail = roi_edge_touched
+                                         ? "face_extent_clipped"
+                                         : "complete_face_extent";
+            best.cloud = support_cloud;
             found = true;
         }
     }
@@ -316,14 +381,18 @@ mission::FaceObservation FaceDetector::detectOnce(
                               best)) {
         return obs;
     }
-    obs.valid = true;
     obs.center = best.center;
     obs.normal = best.normal;
+    obs.tangent_u = best.tangent_u;
+    obs.tangent_v = best.tangent_v;
     obs.width = best.width;
     obs.height = best.height;
     obs.area = best.area;
     obs.confidence = best.confidence;
     obs.surface_cloud = best.cloud;
+    obs.extent_complete = best.extent_complete;
+    obs.extent_detail = best.extent_detail;
+    obs.valid = best.extent_complete;
     return obs;
 }
 
@@ -337,6 +406,21 @@ mission::FaceObservation FaceDetector::process(
     mission::FaceObservation obs;
     if (!extractBestCandidate(cloud, robot_position, tunnel_dir, prior_center, prior_normal,
                               best)) {
+        return obs;
+    }
+
+    if (!best.extent_complete) {
+        obs.center = best.center;
+        obs.normal = best.normal;
+        obs.tangent_u = best.tangent_u;
+        obs.tangent_v = best.tangent_v;
+        obs.width = best.width;
+        obs.height = best.height;
+        obs.area = best.area;
+        obs.confidence = best.confidence;
+        obs.surface_cloud = best.cloud;
+        obs.extent_complete = false;
+        obs.extent_detail = best.extent_detail;
         return obs;
     }
 
@@ -360,11 +444,15 @@ mission::FaceObservation FaceDetector::process(
     obs.valid = true;
     obs.center = best.center;
     obs.normal = best.normal;
+    obs.tangent_u = best.tangent_u;
+    obs.tangent_v = best.tangent_v;
     obs.width = best.width;
     obs.height = best.height;
     obs.area = best.area;
     obs.confidence = best.confidence;
     obs.surface_cloud = best.cloud;
+    obs.extent_complete = true;
+    obs.extent_detail = best.extent_detail;
     return obs;
 }
 

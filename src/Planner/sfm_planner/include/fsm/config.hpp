@@ -430,6 +430,8 @@ namespace fsm {
                              inspection_mission.use_internal_detector, false);
             loader.LoadParam("inspection_mission/apply_change_region_mask",
                              inspection_mission.apply_change_region_mask, true);
+            loader.LoadParam("inspection_mission/persist_target_on_success",
+                             inspection_mission.persist_target_on_success, true);
             loader.LoadParam("inspection_mission/target_file", inspection_mission.target_file,
                              string("config/mission_target.yaml"));
             loader.LoadParam("inspection_mission/start_service", inspection_mission.start_service,
@@ -495,14 +497,32 @@ namespace fsm {
                              inspection_mission.face_cluster_min_size, 200);
             loader.LoadParam("inspection_mission/face/ransac_dist",
                              inspection_mission.face_ransac_dist, 0.08);
+            loader.LoadParam("inspection_mission/face/lateral_half_width",
+                             inspection_mission.face_lateral_half_width, 7.0);
+            loader.LoadParam("inspection_mission/face/vertical_half_height",
+                             inspection_mission.face_vertical_half_height, 5.0);
+            loader.LoadParam("inspection_mission/face/roi_edge_margin",
+                             inspection_mission.face_roi_edge_margin, 0.35);
+            loader.LoadParam("inspection_mission/face/support_plane_distance",
+                             inspection_mission.face_support_plane_distance, 0.45);
+            loader.LoadParam("inspection_mission/face/extent_padding",
+                             inspection_mission.face_extent_padding, 0.25);
             loader.LoadParam("inspection_mission/face/prior_center_tolerance",
                              inspection_mission.face_prior_center_tolerance, 3.0);
             loader.LoadParam("inspection_mission/face/prior_normal_alignment_min",
                              inspection_mission.face_prior_normal_alignment_min, 0.9);
+            loader.LoadParam("inspection_mission/face/recenter_on_clipped",
+                             inspection_mission.face_recenter_on_clipped, true);
+            loader.LoadParam("inspection_mission/face/recenter_max_attempts",
+                             inspection_mission.face_recenter_max_attempts, 1);
             loader.LoadParam("inspection_mission/coverage/camera_hfov_deg",
                              inspection_mission.camera_hfov_deg, 70.0);
             loader.LoadParam("inspection_mission/coverage/camera_vfov_deg",
                              inspection_mission.camera_vfov_deg, 50.0);
+            loader.LoadParam("inspection_mission/coverage/camera_min_pitch_deg",
+                             inspection_mission.camera_min_pitch_deg, -35.0);
+            loader.LoadParam("inspection_mission/coverage/camera_max_pitch_deg",
+                             inspection_mission.camera_max_pitch_deg, 35.0);
             loader.LoadParam("inspection_mission/coverage/capture_distance",
                              inspection_mission.capture_distance, 4.0);
             loader.LoadParam("inspection_mission/coverage/image_overlap",
@@ -517,8 +537,18 @@ namespace fsm {
                              inspection_mission.surface_sample_resolution, 0.4);
             loader.LoadParam("inspection_mission/coverage/visibility_unknown_as_occupied",
                              inspection_mission.visibility_unknown_as_occupied, false);
+            loader.LoadParam("inspection_mission/coverage/visibility_use_raw_occlusion_check",
+                             inspection_mission.visibility_use_raw_occlusion_check, true);
+            loader.LoadParam("inspection_mission/coverage/allow_single_view_boundary_coverage",
+                             inspection_mission.allow_single_view_boundary_coverage, false);
+            loader.LoadParam("inspection_mission/coverage/camera_viewpoint_height_min",
+                             inspection_mission.camera_viewpoint_height_min, 0.5);
+            loader.LoadParam("inspection_mission/coverage/camera_viewpoint_height_max",
+                             inspection_mission.camera_viewpoint_height_max, 5.0);
+            loader.LoadParam("inspection_mission/coverage/camera_viewpoint_lateral_limit",
+                             inspection_mission.camera_viewpoint_lateral_limit, 0.0);
             loader.LoadParam("inspection_mission/coverage/min_predicted_coverage",
-                             inspection_mission.min_predicted_coverage, 0.95);
+                             inspection_mission.min_predicted_coverage, 1.0);
             loader.LoadParam("inspection_mission/coverage/max_viewpoints",
                              inspection_mission.max_viewpoints, 60);
             loader.LoadParam("inspection_mission/coverage/capture_settle_time_sec",

@@ -4,6 +4,9 @@
 #include <sfm_planner/FaceDetectionRequest.h>
 #include <sfm_planner/FaceObservation.h>
 
+#include <Eigen/Dense>
+
+#include <cmath>
 #include <string>
 
 namespace {
@@ -49,10 +52,29 @@ private:
         msg.normal.x = face_normal_x_;
         msg.normal.y = face_normal_y_;
         msg.normal.z = face_normal_z_;
+        Eigen::Vector3d n(face_normal_x_, face_normal_y_, face_normal_z_);
+        if (n.norm() < 1e-6) {
+            n = -Eigen::Vector3d::UnitX();
+        }
+        n.normalize();
+        Eigen::Vector3d reference = Eigen::Vector3d::UnitZ();
+        if (std::abs(n.dot(reference)) > 0.95) {
+            reference = Eigen::Vector3d::UnitY();
+        }
+        const Eigen::Vector3d u = reference.cross(n).normalized();
+        const Eigen::Vector3d v = n.cross(u).normalized();
+        msg.tangent_u.x = u.x();
+        msg.tangent_u.y = u.y();
+        msg.tangent_u.z = u.z();
+        msg.tangent_v.x = v.x();
+        msg.tangent_v.y = v.y();
+        msg.tangent_v.z = v.z();
         msg.width = 8.0;
         msg.height = 5.0;
         msg.area = 40.0;
         msg.confidence = 0.92;
+        msg.extent_complete = true;
+        msg.extent_detail = "mock_face_extent";
         face_pub_.publish(msg);
         ROS_INFO("Published mock FaceObservation");
     }

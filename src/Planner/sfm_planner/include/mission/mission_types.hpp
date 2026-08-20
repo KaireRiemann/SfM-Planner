@@ -14,6 +14,10 @@ namespace mission {
 enum class InspectionState {
     IDLE = 0,
     GO_TO_TARGET,
+    // The first face observation reached its ROI boundary.  Navigate to a
+    // face-centred stand-off pose and perform one fresh observation instead
+    // of treating a cropped rectangle as coverage-ready.
+    GO_TO_FACE_RECENTER,
     WAIT_FACE_RESULT,
     PLAN_VIEWS,
     GO_TO_VIEWPOINT,
@@ -26,6 +30,7 @@ enum class InspectionState {
 enum class NavigationRole {
     EXTERNAL_CLICK = 0,
     APPROACH_TARGET,
+    FACE_RECENTER,
     CAPTURE_VIEWPOINT,
     HOME
 };
@@ -36,6 +41,8 @@ inline const char *toString(const InspectionState state) {
             return "IDLE";
         case InspectionState::GO_TO_TARGET:
             return "GO_TO_TARGET";
+        case InspectionState::GO_TO_FACE_RECENTER:
+            return "GO_TO_FACE_RECENTER";
         case InspectionState::WAIT_FACE_RESULT:
             return "WAIT_FACE_RESULT";
         case InspectionState::PLAN_VIEWS:
@@ -61,6 +68,8 @@ inline const char *toString(const NavigationRole role) {
             return "EXTERNAL_CLICK";
         case NavigationRole::APPROACH_TARGET:
             return "APPROACH_TARGET";
+        case NavigationRole::FACE_RECENTER:
+            return "FACE_RECENTER";
         case NavigationRole::CAPTURE_VIEWPOINT:
             return "CAPTURE_VIEWPOINT";
         case NavigationRole::HOME:
@@ -103,12 +112,23 @@ struct FaceObservation {
     bool valid{false};
     Eigen::Vector3d center{Eigen::Vector3d::Zero()};
     Eigen::Vector3d normal{-Eigen::Vector3d::UnitX()};
+    // `tangent_u` and `tangent_v` define the rectangle used by detection,
+    // coverage planning and visualization.  Keeping them with the observation
+    // avoids silently rotating a PCA-sized rectangle when it crosses a ROS
+    // boundary or is rendered in RViz.
+    Eigen::Vector3d tangent_u{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d tangent_v{Eigen::Vector3d::Zero()};
     pcl::PointCloud<pcl::PointXYZ>::Ptr surface_cloud{
             new pcl::PointCloud<pcl::PointXYZ>()};
     double width{0.0};
     double height{0.0};
     double area{0.0};
     double confidence{0.0};
+    // False means the detected support reaches the perception ROI boundary;
+    // the reported extent can then be only a cropped part of the face and is
+    // never eligible for a coverage mission.
+    bool extent_complete{false};
+    std::string extent_detail;
 };
 
 struct CaptureViewpoint {
@@ -183,6 +203,9 @@ struct MissionContext {
     uint32_t next_request_id{1};
     uint32_t active_face_request_id{0};
     uint32_t active_capture_request_id{0};
+    // Number of detection-driven recenter moves in this run.  It is runtime
+    // state only: an incomplete face must never overwrite MissionTarget.
+    uint32_t face_recenter_attempts{0};
 
     // Monotonic-clock timestamps for the portion of the mission that starts
     // when the coverage plan is accepted and ends at the final successful
@@ -228,6 +251,11 @@ struct InspectionMissionConfig {
     bool mock_capture{true};
     bool use_internal_detector{false};
     bool apply_change_region_mask{true};
+    // Real excavation advances the face, so a successful transaction normally
+    // becomes the next mission's prior.  Disable this only for static replay
+    // scenes, where writing the observed wall back would move the next
+    // approach point into the same, unchanged wall.
+    bool persist_target_on_success{true};
     std::string target_file{"config/mission_target.yaml"};
 
     std::string start_service{"/inspection/start"};
@@ -267,11 +295,34 @@ struct InspectionMissionConfig {
     double face_cluster_tolerance{0.35};
     int face_cluster_min_size{200};
     double face_ransac_dist{0.08};
+    // Detection ROI centred at the inspection pose.  It must contain the
+    // complete end face plus this boundary margin; otherwise detection fails
+    // instead of declaring coverage of a cropped patch.
+    double face_lateral_half_width{7.0};
+    double face_vertical_half_height{5.0};
+    double face_roi_edge_margin{0.35};
+    // RANSAC supplies only a local normal seed.  All cluster points within
+    // this normal distance form the end-face support used for the extent.
+    double face_support_plane_distance{0.45};
+    // Conservative exterior margin around the measured support rectangle.
+    double face_extent_padding{0.25};
     double face_prior_center_tolerance{3.0};
     double face_prior_normal_alignment_min{0.9};
+    // A support cloud that touches the ROI boundary carries useful geometry
+    // (centre and normal), but not a complete face extent.  Recenter once
+    // from that geometry and rerun detection with a fresh ROI.  Disable this
+    // explicitly for deployments that require a manually fixed observation
+    // pose.
+    bool face_recenter_on_clipped{true};
+    int face_recenter_max_attempts{1};
 
     double camera_hfov_deg{70.0};
     double camera_vfov_deg{50.0};
+    // Mechanical camera/gimbal pitch limits.  These are distinct from the
+    // viewing FOV and let a camera in the legal flight-height band inspect a
+    // taller face.
+    double camera_min_pitch_deg{-35.0};
+    double camera_max_pitch_deg{35.0};
     double capture_distance{4.0};
     double image_overlap{0.7};
     int min_observation_count{2};
@@ -282,7 +333,15 @@ struct InspectionMissionConfig {
     // Flight poses remain checked against the inflated map; this controls
     // whether unobserved cells may block a candidate image ray.
     bool visibility_unknown_as_occupied{false};
-    double min_predicted_coverage{0.95};
+    bool visibility_use_raw_occlusion_check{true};
+    bool allow_single_view_boundary_coverage{false};
+    double camera_viewpoint_height_min{0.5};
+    double camera_viewpoint_height_max{5.0};
+    double camera_viewpoint_lateral_limit{0.0};
+    // A mission may complete only after the whole coverage rectangle satisfies
+    // its multi-view requirement.  Lower values are retained as an explicit
+    // escape hatch for degraded operations, not the normal inspection mode.
+    double min_predicted_coverage{1.0};
     int max_viewpoints{60};
     // Hold at a capture pose before triggering the camera.  This gives the
     // vehicle estimator/camera time to settle and ensures the next leg starts

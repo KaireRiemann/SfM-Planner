@@ -970,7 +970,19 @@ namespace general_planner {
         }
         Trajectory new_traj, old_traj;
 
-        if (!services.traj_manager->yaw()->optimize(init_yaw, fina_yaw, out_traj, new_traj, 3, false, free_end)) {
+        if (!services.traj_manager->yaw()->optimize(
+                    init_yaw,
+                    fina_yaw,
+                    out_traj,
+                    new_traj,
+                    3,
+                    false,
+                    free_end,
+                    // Capture viewpoints have a mandatory camera yaw.  A
+                    // velocity-heading yaw spline can otherwise turn away
+                    // from the face mid-leg and exceed the yaw-rate limit
+                    // while returning to the same optical heading at rest.
+                    !use_capture_profile)) {
             services.ros_ptr->error(" -- [GeneralPlanner] in [generateExpTraj]: YawTrajOpt failed, force return");
             return FAILED;
         }

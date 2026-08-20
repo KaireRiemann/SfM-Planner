@@ -33,16 +33,25 @@ InspectionMissionPlanner::InspectionMissionPlanner(
     coverage::FaceViewpointPlanner::Config vp_cfg;
     vp_cfg.camera.hfov_deg = cfg_.camera_hfov_deg;
     vp_cfg.camera.vfov_deg = cfg_.camera_vfov_deg;
+    vp_cfg.camera.min_pitch_deg = cfg_.camera_min_pitch_deg;
+    vp_cfg.camera.max_pitch_deg = cfg_.camera_max_pitch_deg;
     vp_cfg.camera.capture_distance = cfg_.capture_distance;
     vp_cfg.camera.image_overlap = cfg_.image_overlap;
     vp_cfg.camera.max_incidence_angle_deg = cfg_.max_incidence_angle_deg;
     vp_cfg.min_observation_count = cfg_.min_observation_count;
     vp_cfg.min_baseline_angle_deg = cfg_.min_baseline_angle_deg;
     vp_cfg.surface_sample_resolution = cfg_.surface_sample_resolution;
+    vp_cfg.required_coverage_ratio = cfg_.min_predicted_coverage;
     vp_cfg.unknown_as_occupied = cfg_.visibility_unknown_as_occupied;
+    vp_cfg.use_raw_occlusion_check = cfg_.visibility_use_raw_occlusion_check;
+    vp_cfg.allow_single_view_boundary_coverage =
+            cfg_.allow_single_view_boundary_coverage;
     vp_cfg.safe_radius = cfg_.safe_radius;
     vp_cfg.flight_height_min = cfg_.flight_height_min;
     vp_cfg.flight_height_max = cfg_.flight_height_max;
+    vp_cfg.viewpoint_height_min = cfg_.camera_viewpoint_height_min;
+    vp_cfg.viewpoint_height_max = cfg_.camera_viewpoint_height_max;
+    vp_cfg.viewpoint_lateral_limit = cfg_.camera_viewpoint_lateral_limit;
     vp_cfg.max_viewpoints = cfg_.max_viewpoints;
     viewpoint_planner_ = std::make_shared<coverage::FaceViewpointPlanner>(vp_cfg);
 }
@@ -88,6 +97,8 @@ NavigationRole InspectionMissionPlanner::expectedNavigationRole() const {
     switch (state_) {
         case InspectionState::GO_TO_TARGET:
             return NavigationRole::APPROACH_TARGET;
+        case InspectionState::GO_TO_FACE_RECENTER:
+            return NavigationRole::FACE_RECENTER;
         case InspectionState::GO_TO_VIEWPOINT:
             return NavigationRole::CAPTURE_VIEWPOINT;
         case InspectionState::RETURN_HOME:
@@ -132,20 +143,19 @@ void InspectionMissionPlanner::publishStatusLocked(const std::string &detail) co
 
 bool InspectionMissionPlanner::searchApproachPoint(const Eigen::Vector3d &center,
                                                    const Eigen::Vector3d &normal,
-                                                   Eigen::Vector3d &nav_goal) const {
+                                                   Eigen::Vector3d &nav_goal,
+                                                   const double preferred_distance) const {
     Eigen::Vector3d n = normal;
     if (n.norm() < 1e-6) {
         return false;
     }
     n.normalize();
     auto map = map_provider_ ? map_provider_() : nullptr;
-    for (double d = cfg_.approach_distance_min;
-         d <= cfg_.approach_distance_max + 1e-9;
-         d += std::max(0.05, cfg_.approach_distance_step)) {
+    const auto accept_distance = [&](const double d) {
         const Eigen::Vector3d candidate = center + d * n;
         if (candidate.z() < cfg_.flight_height_min ||
             candidate.z() > cfg_.flight_height_max) {
-            continue;
+            return false;
         }
         if (!map || !map->ready()) {
             nav_goal = candidate;
@@ -153,24 +163,41 @@ bool InspectionMissionPlanner::searchApproachPoint(const Eigen::Vector3d &center
         }
         const rog_map::Vec3f p(candidate.x(), candidate.y(), candidate.z());
         if (!map->insideLocalMap(p)) {
-            continue;
+            return false;
         }
         const auto gt = map->getInfGridType(p);
         if (gt == rog_map::GridType::OCCUPIED || gt == rog_map::GridType::OUT_OF_MAP) {
-            continue;
+            return false;
         }
         if (map->hasESDF()) {
             double dist = 0.0;
             rog_map::Vec3f grad = rog_map::Vec3f::Zero();
             if (!map->evaluateESDF(p, dist, grad) || !std::isfinite(dist) ||
                 dist < cfg_.safe_radius) {
-                continue;
+                return false;
             }
         } else if (map->getGridType(p) == rog_map::GridType::OCCUPIED) {
-            continue;
+            return false;
         }
         nav_goal = candidate;
         return true;
+    };
+
+    // A cropped observation still measures the stand-off that produced useful
+    // support.  Prefer retaining it after lateral/vertical centring; moving
+    // unnecessarily closer can narrow a real sensor's vertical field of view.
+    if (std::isfinite(preferred_distance) &&
+        preferred_distance >= cfg_.approach_distance_min &&
+        preferred_distance <= cfg_.approach_distance_max &&
+        accept_distance(preferred_distance)) {
+        return true;
+    }
+    for (double d = cfg_.approach_distance_min;
+         d <= cfg_.approach_distance_max + 1e-9;
+         d += std::max(0.05, cfg_.approach_distance_step)) {
+        if (accept_distance(d)) {
+            return true;
+        }
     }
     return false;
 }
@@ -224,6 +251,8 @@ FaceObservation InspectionMissionPlanner::makePriorFaceObservation() const {
     face.height = height;
     face.area = width * height;
     face.confidence = std::max(target.confidence, cfg_.face_min_confidence);
+    face.extent_complete = true;
+    face.extent_detail = "stored_face_extent";
     return face;
 }
 
@@ -255,6 +284,8 @@ FaceObservation InspectionMissionPlanner::makeMockFaceObservation(
     obs.height = std::max(3.0, t.previous_face_region.height);
     obs.area = obs.width * obs.height;
     obs.confidence = 0.9;
+    obs.extent_complete = true;
+    obs.extent_detail = "mock_face_extent";
     obs.surface_cloud.reset(new pcl::PointCloud<pcl::PointXYZ>());
     Eigen::Vector3d up = Eigen::Vector3d::UnitZ();
     if (std::abs(n.dot(up)) > 0.95) {
@@ -262,6 +293,8 @@ FaceObservation InspectionMissionPlanner::makeMockFaceObservation(
     }
     const Eigen::Vector3d u = (up.cross(n)).normalized();
     const Eigen::Vector3d v = n.cross(u);
+    obs.tangent_u = u;
+    obs.tangent_v = v;
     for (double ou = -0.5 * obs.width; ou <= 0.5 * obs.width; ou += 0.4) {
         for (double ov = -0.5 * obs.height; ov <= 0.5 * obs.height; ov += 0.4) {
             const Eigen::Vector3d p = obs.center + ou * u + ov * v;
@@ -436,6 +469,78 @@ void InspectionMissionPlanner::failAndReturnHome(const std::string &reason) {
     returnHome();
 }
 
+bool InspectionMissionPlanner::requestFaceDetection(const std::string &detail) {
+    setState(InspectionState::WAIT_FACE_RESULT, detail);
+    FaceDetectionRequest request;
+    request.mission_id = ctx_.mission_id;
+    request.target_version = ctx_.active_target.version;
+    request.request_id = ctx_.next_request_id++;
+    ctx_.active_face_request_id = request.request_id;
+    if (publish_face_request_) {
+        publish_face_request_(request);
+    }
+    return true;
+}
+
+bool InspectionMissionPlanner::recenterForClippedFace(
+        const FaceObservation &observation) {
+    if (observation.extent_detail != "face_extent_clipped" ||
+        !cfg_.face_recenter_on_clipped ||
+        cfg_.face_recenter_max_attempts <= 0 ||
+        ctx_.face_recenter_attempts >=
+                static_cast<uint32_t>(cfg_.face_recenter_max_attempts)) {
+        return false;
+    }
+    if (!observation.center.allFinite() || !observation.normal.allFinite() ||
+        observation.normal.norm() < 1e-6 || !submit_nav_) {
+        return false;
+    }
+
+    // The detector convention is that the normal points into free space /
+    // toward the observing vehicle.  Enforce that convention again before
+    // searching so an upstream detector cannot send the retry through the
+    // blast face.
+    Eigen::Vector3d normal = observation.normal.normalized();
+    const Eigen::Vector3d to_robot =
+            ctx_.last_navigation_pose.position - observation.center;
+    if (to_robot.norm() > 1e-6 && normal.dot(to_robot) < 0.0) {
+        normal = -normal;
+    }
+
+    MissionPose recenter_goal;
+    const double observed_standoff = normal.dot(to_robot);
+    if (!searchApproachPoint(observation.center,
+                             normal,
+                             recenter_goal.position,
+                             observed_standoff)) {
+        return false;
+    }
+    recenter_goal.yaw = std::atan2(-normal.y(), -normal.x());
+    if (!std::isfinite(recenter_goal.yaw)) {
+        return false;
+    }
+
+    ++ctx_.face_recenter_attempts;
+    ctx_.active_face_request_id = 0;
+    setState(InspectionState::GO_TO_FACE_RECENTER,
+             fmt::format("face_extent_clipped_recenter_{}/{}",
+                         ctx_.face_recenter_attempts,
+                         std::max(0, cfg_.face_recenter_max_attempts)));
+    fmt::print(fg(fmt::color::yellow),
+               " -- [Inspection] Face support reached the detection ROI; recenter {}/{} to "
+               "({:.2f}, {:.2f}, {:.2f}), yaw {:.3f} and detect again.\n",
+               ctx_.face_recenter_attempts,
+               std::max(0, cfg_.face_recenter_max_attempts),
+               recenter_goal.position.x(),
+               recenter_goal.position.y(),
+               recenter_goal.position.z(),
+               recenter_goal.yaw);
+    if (!submit_nav_(recenter_goal, NavigationRole::FACE_RECENTER)) {
+        failAndReturnHome("submit_face_recenter_failed");
+    }
+    return true;
+}
+
 bool InspectionMissionPlanner::dispatchCurrentViewpoint() {
     if (ctx_.viewpoint_index >= ctx_.viewpoints.size()) {
         return false;
@@ -531,7 +636,18 @@ bool InspectionMissionPlanner::planViewsFromPending(const MissionPose &robot) {
 }
 
 bool InspectionMissionPlanner::commitPendingTarget() {
-    if (!ctx_.has_pending_target || !store_) {
+    if (!ctx_.has_pending_target) {
+        return false;
+    }
+    if (!cfg_.persist_target_on_success) {
+        // A static replay has no blast/update between runs.  Retaining the
+        // initial observation anchor keeps repeated missions observable while
+        // still exercising the complete detection and coverage transaction.
+        ctx_.has_pending_target = false;
+        ctx_.has_pending_face_observation = false;
+        return true;
+    }
+    if (!store_) {
         return false;
     }
     if (!store_->saveAtomic(ctx_.pending_target)) {
@@ -575,17 +691,13 @@ void InspectionMissionPlanner::onNavigationSucceeded(NavigationRole role,
                 }
                 return;
             }
-            setState(InspectionState::WAIT_FACE_RESULT, "request_face");
-            FaceDetectionRequest request;
-            request.mission_id = ctx_.mission_id;
-            request.target_version = ctx_.active_target.version;
-            request.request_id = ctx_.next_request_id++;
-            ctx_.active_face_request_id = request.request_id;
-            if (publish_face_request_) {
-                publish_face_request_(request);
-            }
+            requestFaceDetection("request_face");
             if (cfg_.mock_face_detection) {
                 // Unlock temporarily is unsafe; synthesize under same lock.
+                FaceDetectionRequest request;
+                request.mission_id = ctx_.mission_id;
+                request.target_version = ctx_.active_target.version;
+                request.request_id = ctx_.active_face_request_id;
                 const auto mock = makeMockFaceObservation(robot, request);
                 // Re-enter through unlocked path by inlined handling:
                 if (!mock.valid) {
@@ -599,6 +711,15 @@ void InspectionMissionPlanner::onNavigationSucceeded(NavigationRole role,
                 if (!planViewsFromPending(robot)) {
                     failAndReturnHome("plan_views_failed");
                 }
+            }
+            return;
+        }
+        case InspectionState::GO_TO_FACE_RECENTER: {
+            if (role != NavigationRole::FACE_RECENTER) {
+                return;
+            }
+            if (!requestFaceDetection("request_face_after_recenter")) {
+                failAndReturnHome("request_face_after_recenter_failed");
             }
             return;
         }
@@ -698,9 +819,16 @@ void InspectionMissionPlanner::onFaceObservation(const FaceObservation &observat
         observation.request_id != ctx_.active_face_request_id) {
         return;
     }
-    if (!observation.valid || observation.confidence < cfg_.face_min_confidence ||
+    if ((!observation.valid || !observation.extent_complete) &&
+        recenterForClippedFace(observation)) {
+        return;
+    }
+    if (!observation.valid || !observation.extent_complete ||
+        observation.confidence < cfg_.face_min_confidence ||
         observation.area < cfg_.face_min_area) {
-        failAndReturnHome("invalid_face_observation");
+        failAndReturnHome(observation.extent_detail.empty()
+                                  ? "invalid_face_observation"
+                                  : observation.extent_detail);
         return;
     }
     ctx_.active_face_request_id = 0;

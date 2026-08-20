@@ -26,7 +26,26 @@ public:
         double safe_radius{0.6};
         double flight_height_min{0.5};
         double flight_height_max{5.0};
+        // Capture poses can use a narrower, dynamics-validated height band
+        // than the global navigation workspace; camera pitch covers the
+        // remaining vertical face extent.
+        double viewpoint_height_min{0.5};
+        double viewpoint_height_max{5.0};
+        // Optional half-width of the camera flight corridor in the face's
+        // lateral tangent direction.  Non-positive disables the limit.
+        double viewpoint_lateral_limit{0.0};
         bool unknown_as_occupied{true};
+        // The raw lidar map is useful for camera-pose collision safety, but
+        // may contain the detected end-face itself as occupied.  Enable this
+        // only when it is also a trustworthy optical occlusion map.
+        bool use_raw_occlusion_check{true};
+        // A complete primary (one-view) cover can be accepted when only
+        // boundary samples lack a second safe-baseline observation.  This is
+        // opt-in; normal SfM operation keeps strict K-view coverage.
+        bool allow_single_view_boundary_coverage{false};
+        // A complete face rectangle is accepted only if every coverage grid
+        // sample reaches the requested multi-view observation count.
+        double required_coverage_ratio{1.0};
         // Upper bound on capture poses selected for a single face.  It must
         // be high enough to satisfy K-coverage for large tunnel faces.
         int max_viewpoints{60};

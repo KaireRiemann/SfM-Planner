@@ -93,7 +93,11 @@ public:
                 Trajectory &out_traj,
                 const int &order = 3,
                 const bool &free_start = false,
-                const bool &free_goal = true);
+                const bool &free_goal = true,
+                // A camera pose has an explicit terminal optical yaw.  Do
+                // not insert velocity-heading waypoints that would turn away
+                // from the face and then turn back just before capture.
+                const bool follow_position_heading = true);
 
 private:
   static Trajectory toGeometryTrajectory(const YawTraj &traj);

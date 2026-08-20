@@ -16,3 +16,4 @@ __pycache__/
 /src/Planner/general_planner/log
 /tmp
 /test_results
+/Tests

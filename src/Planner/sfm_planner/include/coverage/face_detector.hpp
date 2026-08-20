@@ -26,8 +26,17 @@ public:
         int stability_frames{3};
         double stability_center_tol{0.35};
         double stability_normal_tol{0.15};
-        double lateral_half_width{6.0};
-        double vertical_half_height{4.0};
+        double lateral_half_width{7.0};
+        double vertical_half_height{5.0};
+        // A detected face that reaches this close to the ROI boundary is
+        // treated as cropped.  The robot must move to a better observation
+        // pose or the ROI must be enlarged before coverage can start.
+        double roi_edge_margin{0.35};
+        // A RANSAC plane is used only as a seed.  This admits moderately
+        // curved/rough end-face points while rejecting the distant tunnel
+        // walls that meet it at the perimeter.
+        double support_plane_distance{0.45};
+        double extent_padding{0.25};
         // The mission already has a coarse target from the prior map.  These
         // gates prevent a large but unrelated tunnel wall from replacing it.
         // A non-positive center tolerance or normal threshold disables the
@@ -69,10 +78,14 @@ private:
     struct Candidate {
         Eigen::Vector3d center{Eigen::Vector3d::Zero()};
         Eigen::Vector3d normal{-Eigen::Vector3d::UnitX()};
+        Eigen::Vector3d tangent_u{Eigen::Vector3d::Zero()};
+        Eigen::Vector3d tangent_v{Eigen::Vector3d::Zero()};
         double width{0.0};
         double height{0.0};
         double area{0.0};
         double confidence{0.0};
+        bool extent_complete{false};
+        std::string extent_detail;
         pcl::PointCloud<pcl::PointXYZ>::Ptr cloud{new pcl::PointCloud<pcl::PointXYZ>()};
     };
 

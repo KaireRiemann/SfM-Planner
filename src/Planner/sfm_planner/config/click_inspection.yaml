@@ -487,6 +487,9 @@ inspection_mission:
   # The initial cave1 target below is a manual observation anchor, not a
   # previously confirmed blast face.  Do not erase its forward surface.
   apply_change_region_mask: false
+  # A successful inspection is a transaction: promote the observed face to
+  # the next mission prior, exactly as on the real robot.
+  persist_target_on_success: true
   # This launch profile follows click_cave1.launch and uses cave1.pcd.  Keep
   # the production Qingyuan prior in mission_target.yaml untouched; the
   # simulation target below is calibrated from cave1.pcd instead.
@@ -528,6 +531,21 @@ inspection_mission:
     cluster_tolerance: 0.35
     cluster_min_size: 200
     ransac_dist: 0.08
+    # Live cave1 replay shows an approximately 15.5 x 10.2 m end-face after
+    # recentering.  These are half extents around the inspection pose, not
+    # desired face dimensions.  Keep >0.35 m of headroom for both the ROI
+    # crop check and the small centre shift between the initial and complete
+    # plane supports; a cropped face is still rejected.
+    lateral_half_width: 9.0
+    vertical_half_height: 7.0
+    roi_edge_margin: 0.35
+    # RANSAC finds a normal seed; the whole near-coplanar end-face support is
+    # used to form the coverage rectangle.
+    support_plane_distance: 0.45
+    # Extents already come from the complete coplanar support.  Do not extend
+    # the rectangle beyond its observed border: those synthetic edge cells
+    # cannot be used as evidence of full face coverage.
+    extent_padding: 0.0
     stability_frames: 3
     stability_center_tol: 0.35
     stability_normal_tol: 0.15
@@ -535,10 +553,22 @@ inspection_mission:
     # face_prior_valid.  The current manual anchor explicitly has no prior.
     prior_center_tolerance: 3.0
     prior_normal_alignment_min: 0.9
+    # If a valid plane support reaches the ROI edge, use its centre/normal to
+    # move to a safe face-centred stand-off pose and retry.  One extra retry
+    # handles the expected support-centre shift when new border points enter
+    # the enlarged ROI.  The cropped observation is never passed to coverage.
+    recenter_on_clipped: true
+    recenter_max_attempts: 2
   coverage:
     camera_hfov_deg: 70.0
     camera_vfov_deg: 50.0
-    capture_distance: 4.0
+    # The detected cave1 end-face reaches roughly 9.8 m high while the flight
+    # band tops out at 5 m.  A 6 m footprint keeps the right-hand edge
+    # observable from inside the locally connected flight corridor; tilt the
+    # camera to inspect its upper/lower edges.
+    camera_min_pitch_deg: -55.0
+    camera_max_pitch_deg: 55.0
+    capture_distance: 6.0
     image_overlap: 0.7
     min_observation_count: 2
     min_baseline_angle_deg: 8.0
@@ -548,7 +578,29 @@ inspection_mission:
     # sensor ray. Unknown cells cannot invalidate image visibility; occupied
     # cells still do, and flight poses use the inflated collision map.
     visibility_unknown_as_occupied: false
-    min_predicted_coverage: 0.95
+    # This simulator's raw occupied cells include the detected end face
+    # itself, so they cannot be used as an optical occlusion oracle.  Camera
+    # flight poses are still collision-checked against the inflated map; full
+    # rectangle coverage uses FOV and incidence over the detected plane.
+    visibility_use_raw_occlusion_check: false
+    # Keep the two-view SfM objective wherever geometry permits it.  When
+    # every rectangle sample is visible but only a boundary cell lacks a
+    # second safe baseline, accept the complete primary cover rather than
+    # returning home without any inspection.
+    allow_single_view_boundary_coverage: true
+    # Keep capture positions in the height band validated by the local
+    # state-to-state planner.  The camera's ±55 degree pitch covers the upper
+    # and lower face cells without sending the vehicle to high, disconnected
+    # viewpoints.
+    camera_viewpoint_height_min: 0.5
+    camera_viewpoint_height_max: 5.0
+    # The face edges remain inside the 6 m camera footprint from this
+    # corridor, while points that would push the vehicle into the right wall
+    # are rejected before navigation.
+    camera_viewpoint_lateral_limit: 6.0
+    # Complete rectangle coverage is required.  A plan with an unobservable
+    # edge/corner fails instead of silently accepting a 95% local patch.
+    min_predicted_coverage: 1.0
     # cave1's ~12 x 8 m face needs more than the old implicit 24-view cap
     # when every sample must be observed twice.
     max_viewpoints: 60

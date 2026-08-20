@@ -191,8 +191,12 @@ public:
 
     const bool accepted_fast_stop =
         status == lbfgs::LBFGS_CANCELED && report_.fast_stop_satisfied;
+    // The fallback is a numerical recovery path, independent of whether the
+    // caller enabled early stopping.  Capture trajectories deliberately use
+    // the classical convergence policy (`early_stop_enabled == false`), and
+    // still need this retry after a recoverable line-search failure.
     if (allow_fallback && status < 0 && !accepted_fast_stop &&
-        options_.fallback_on_failure && options_.early_stop_enabled)
+        options_.fallback_on_failure)
     {
       report_.fallback_used = true;
       x = restart;

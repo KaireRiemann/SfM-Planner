@@ -7,6 +7,7 @@
 #include <map_manager/map_manager.hpp>
 
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -64,13 +65,19 @@ public:
 
     bool searchApproachPoint(const Eigen::Vector3d &center,
                              const Eigen::Vector3d &normal,
-                             Eigen::Vector3d &nav_goal) const;
+                             Eigen::Vector3d &nav_goal,
+                             double preferred_distance =
+                                     std::numeric_limits<double>::quiet_NaN()) const;
 
 private:
     void setState(InspectionState state, const std::string &detail = "");
     void publishStatusLocked(const std::string &detail = "") const;
     void failAndReturnHome(const std::string &reason);
     void returnHome(const std::string &detail = "return_home");
+    bool requestFaceDetection(const std::string &detail);
+    // Returns true when the clipped observation was handled, including a
+    // failed recenter submission that has already transitioned to return-home.
+    bool recenterForClippedFace(const FaceObservation &observation);
     bool dispatchCurrentViewpoint();
     bool planViewsFromPending(const MissionPose &robot);
     bool commitPendingTarget();

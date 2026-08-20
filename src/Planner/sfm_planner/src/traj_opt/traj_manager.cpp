@@ -1079,7 +1079,11 @@ void ExpTrajOpt::configureFastLbfgs(double rel_cost_tol,
                      std::max(3, decision_dim))
           : 256;
   options.fallback_mem_size = 256;
-  options.fallback_on_failure = early_stop_enabled;
+  // A capture profile intentionally disables the fast early-stop rule, but
+  // it must still get the classical numerical retry.  Tying fallback to the
+  // early-stop flag made a perfectly valid short rest-to-rest capture leg
+  // terminal on a transient L-BFGS line-search failure.
+  options.fallback_on_failure = true;
   options.step_bound_enabled = opt_vars_.lbfgs_step_bound_enabled;
   options.window = opt_vars_.lbfgs_fast_window;
   options.min_iterations = opt_vars_.lbfgs_fast_min_iterations;
@@ -2098,6 +2102,60 @@ double ExpTrajOpt::optimize(Trajectory &traj, double rel_cost_tol)
                         /*allow_fallback=*/true,
                         &guide_initial_decision);
   syncFastLbfgsReport();
+
+  // A guide which starts and ends at rest can be dynamically feasible while
+  // its minimum-time seed is still too sharp for the first quasi-Newton line
+  // search.  This is most visible on inspection-grid transitions: the SFC is
+  // valid and the endpoints are only a few metres apart, yet retrying the
+  // same short seed deterministically exhausts the line search.  Retry once
+  // from the *same spatial guide* with twice its physical duration.  It is a
+  // numerical recovery only -- the usual optimizer and all trajectory/yaw
+  // checks remain authoritative -- and it also benefits normal rest-to-rest
+  // planning when a similar short-leg condition occurs.
+  if (ret < 0 && opt_vars_.piece_num > 0 &&
+      guide_initial_decision.size() >= opt_vars_.piece_num)
+  {
+    VecDf dilated_guide_decision = guide_initial_decision;
+    bool dilation_valid = true;
+    for (int i = 0; i < opt_vars_.piece_num; ++i)
+    {
+      const double duration = time_map_.toTime(guide_initial_decision(i));
+      const double dilated_duration = 2.0 * duration;
+      if (!std::isfinite(duration) || duration <= 1.0e-6 ||
+          !std::isfinite(dilated_duration))
+      {
+        dilation_valid = false;
+        break;
+      }
+      dilated_guide_decision(i) = time_map_.toTau(dilated_duration);
+      if (!std::isfinite(dilated_guide_decision(i)))
+      {
+        dilation_valid = false;
+        break;
+      }
+    }
+    if (dilation_valid)
+    {
+      std::cout << YELLOW
+                << " -- [ExpTrajOpt] Retrying numerical failure from a "
+                   "time-dilated guide seed."
+                << RESET << std::endl;
+      x = dilated_guide_decision;
+      configureFastLbfgs(rel_cost_tol,
+                         early_stop_enabled,
+                         static_cast<int>(x.size()));
+      fast_lbfgs_.reset();
+      ret = fast_lbfgs_.run(x,
+                            min_cost,
+                            &ExpTrajOpt::costFunctional,
+                            &ExpTrajOpt::stepBoundFunctional,
+                            this,
+                            &ExpTrajOpt::fastLbfgsSnapshot,
+                            /*allow_fallback=*/true,
+                            &dilated_guide_decision);
+      syncFastLbfgsReport();
+    }
+  }
 
   // The stable production line keeps the continuous oracle read-only. The
   // experimental hard-certification line may opt in to a certificate-triggered
@@ -3718,7 +3776,8 @@ bool YawTrajOpt::optimize(const Vec4f &istate_in,
                           Trajectory &out_traj,
                           const int &order,
                           const bool &free_start,
-                          const bool &free_goal)
+                          const bool &free_goal,
+                          const bool follow_position_heading)
 {
   if (order != 3)
   {
@@ -3763,7 +3822,20 @@ bool YawTrajOpt::optimize(const Vec4f &istate_in,
   VecDf times;
   getYawTimeAllocation(pos_traj_dur, times);
   VecDf way_pts;
-  getYawWaypointAllocation(init_state, goal_state, way_pts, times, pos_traj, yaw_dot_max_);
+  if (follow_position_heading)
+  {
+    getYawWaypointAllocation(init_state, goal_state, way_pts, times,
+                             pos_traj, yaw_dot_max_);
+  }
+  else
+  {
+    // Keep one cubic segment spanning the position trajectory.  Normalizing
+    // around the actual start yaw prevents an unnecessary 2*pi turn.
+    times.resize(1);
+    times(0) = pos_traj_dur;
+    way_pts.resize(0);
+    goal_state(0) = normalizeYawNear(init_state(0), goal_state(0));
+  }
 
   Eigen::Matrix<double, 1, Eigen::Dynamic> inner(1, way_pts.size());
   for (int i = 0; i < way_pts.size(); ++i)

@@ -1,9 +1,9 @@
 #include <coverage/face_viewpoint_planner.hpp>
 
 #include <Eigen/Geometry>
-#include <pcl/filters/voxel_grid.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -12,53 +12,78 @@
 namespace coverage {
 namespace {
 
-void buildFaceFrame(const Eigen::Vector3d &normal_in,
+bool buildFaceFrame(const mission::FaceObservation &face,
                     Eigen::Vector3d &n,
                     Eigen::Vector3d &u,
                     Eigen::Vector3d &v) {
-    n = normal_in;
+    n = face.normal;
     if (n.norm() < 1e-6) {
-        n = -Eigen::Vector3d::UnitX();
+        return false;
     }
     n.normalize();
+
+    // Use exactly the detector's face frame when available.  Legacy/external
+    // observations without tangents retain the deterministic world-up frame.
+    u = face.tangent_u - face.tangent_u.dot(n) * n;
+    if (u.norm() > 1e-6) {
+        u.normalize();
+        v = n.cross(u).normalized();
+        if (face.tangent_v.norm() > 1e-6 && face.tangent_v.dot(v) < 0.0) {
+            u = -u;
+            v = -v;
+        }
+        return true;
+    }
     Eigen::Vector3d up = Eigen::Vector3d::UnitZ();
     if (std::abs(n.dot(up)) > 0.95) {
         up = Eigen::Vector3d::UnitY();
     }
     u = (up.cross(n)).normalized();
-    v = n.cross(u);
+    v = n.cross(u).normalized();
+    return true;
 }
 
 std::vector<Eigen::Vector3d> sampleSurfacePoints(const mission::FaceObservation &face,
                                                  const Eigen::Vector3d &u,
                                                  const Eigen::Vector3d &v,
                                                  const double resolution) {
+    // Coverage is evaluated on the entire detected rectangle, including its
+    // four edges.  Do not use the sparse support cloud as the denominator:
+    // that was the source of the former "97% of a small patch" result.
     std::vector<Eigen::Vector3d> points;
-    if (face.surface_cloud && !face.surface_cloud->empty()) {
-        pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
-        voxel_filter.setInputCloud(face.surface_cloud);
-        const float leaf = static_cast<float>(std::max(0.1, resolution));
-        voxel_filter.setLeafSize(leaf, leaf, leaf);
-        pcl::PointCloud<pcl::PointXYZ> downsampled;
-        voxel_filter.filter(downsampled);
-        points.reserve(downsampled.size());
-        for (const auto &pt : downsampled.points) {
-            if (std::isfinite(pt.x) && std::isfinite(pt.y) && std::isfinite(pt.z)) {
-                points.emplace_back(pt.x, pt.y, pt.z);
-            }
-        }
-        return points;
-    }
-
-    const double half_w = 0.5 * std::max(0.5, face.width);
-    const double half_h = 0.5 * std::max(0.5, face.height);
+    const double width = std::max(0.5, face.width);
+    const double height = std::max(0.5, face.height);
     const double step = std::max(0.2, resolution);
-    for (double ou = -half_w; ou <= half_w + 1e-6; ou += step) {
-        for (double ov = -half_h; ov <= half_h + 1e-6; ov += step) {
+    const int count_u = std::max(1, static_cast<int>(std::ceil(width / step)));
+    const int count_v = std::max(1, static_cast<int>(std::ceil(height / step)));
+    points.reserve(static_cast<std::size_t>((count_u + 1) * (count_v + 1)));
+    for (int iu = 0; iu <= count_u; ++iu) {
+        const double ou = width * (static_cast<double>(iu) / count_u - 0.5);
+        for (int iv = 0; iv <= count_v; ++iv) {
+            const double ov = height * (static_cast<double>(iv) / count_v - 0.5);
             points.push_back(face.center + ou * u + ov * v);
         }
     }
     return points;
+}
+
+std::vector<double> makeLatticeAxis(const double half_extent,
+                                    const double step,
+                                    const double offset) {
+    std::vector<double> offsets{-half_extent, half_extent};
+    const double safe_step = std::max(0.05, step);
+    for (double value = -half_extent + offset;
+         value < half_extent - 1e-6;
+         value += safe_step) {
+        if (value > -half_extent + 1e-6) {
+            offsets.push_back(value);
+        }
+    }
+    std::sort(offsets.begin(), offsets.end());
+    offsets.erase(std::unique(offsets.begin(), offsets.end(),
+                              [](double a, double b) { return std::abs(a - b) < 1e-6; }),
+                  offsets.end());
+    return offsets;
 }
 
 rog_map::Vec3f toMapVec(const Eigen::Vector3d &p) {
@@ -113,7 +138,13 @@ bool rayFreeToFaceSurface(const general_planner::MapManager &map,
         return false;
     }
     n.normalize();
-    const double terminal_margin = std::max(0.05, 0.75 * map.getResolution());
+    // The detected plane support has up to 0.45 m depth tolerance and the
+    // raw lidar map represents that rough end-face as several occupied
+    // voxels.  Stop 1.5 m (ten 15 cm voxels in the live map) in front of
+    // the nominal plane so this target surface band is not interpreted as an
+    // unrelated occluder.  The camera position itself remains checked in the
+    // inflated map, and the rest of every optical ray remains raw-map free.
+    const double terminal_margin = std::max(0.10, 10.0 * map.getResolution());
     const Eigen::Vector3d free_side_terminal = surface + terminal_margin * n;
     return map.isLineFree(toMapVec(camera),
                           toMapVec(free_side_terminal),
@@ -143,13 +174,20 @@ bool inFov(const Eigen::Vector3d &view_pos,
     }
     const Eigen::AngleAxisd R_yaw(body_yaw, Eigen::Vector3d::UnitZ());
     const Eigen::AngleAxisd R_pitch(camera_pitch, Eigen::Vector3d::UnitY());
-    const Eigen::Vector3d look = R_yaw * R_pitch * Eigen::Vector3d::UnitX();
+    const Eigen::Matrix3d R = R_yaw.toRotationMatrix() * R_pitch.toRotationMatrix();
+    const Eigen::Vector3d look = R * Eigen::Vector3d::UnitX();
+    const Eigen::Vector3d camera_right = R * Eigen::Vector3d::UnitY();
+    const Eigen::Vector3d camera_up = R * Eigen::Vector3d::UnitZ();
     const Eigen::Vector3d dir = d.normalized();
-    const double cos_angle = std::clamp(look.dot(dir), -1.0, 1.0);
-    const double angle = std::acos(cos_angle);
+    const double forward = look.dot(dir);
+    if (forward <= 1e-6) {
+        return false;
+    }
     const double hfov = camera.hfov_deg * M_PI / 180.0;
     const double vfov = camera.vfov_deg * M_PI / 180.0;
-    return angle <= 0.5 * std::hypot(hfov, vfov);
+    const double horizontal = std::atan2(std::abs(camera_right.dot(dir)), forward);
+    const double vertical = std::atan2(std::abs(camera_up.dot(dir)), forward);
+    return horizontal <= 0.5 * hfov + 1e-6 && vertical <= 0.5 * vfov + 1e-6;
 }
 
 bool incidenceOk(const Eigen::Vector3d &view_pos,
@@ -236,13 +274,20 @@ mission::CoveragePlan FaceViewpointPlanner::plan(
         const Eigen::Vector3d &current_position,
         const Eigen::Vector3d &home) const {
     mission::CoveragePlan plan;
-    if (!face.valid) {
+    if (!face.valid || !face.extent_complete) {
+        plan.detail = face.extent_detail.empty() ? "incomplete_face_extent" : face.extent_detail;
+        return plan;
+    }
+    if (face.width <= 0.0 || face.height <= 0.0) {
         plan.detail = "invalid_face";
         return plan;
     }
 
     Eigen::Vector3d n, u, v;
-    buildFaceFrame(face.normal, n, u, v);
+    if (!buildFaceFrame(face, n, u, v)) {
+        plan.detail = "invalid_face_frame";
+        return plan;
+    }
     const auto surface = sampleSurfacePoints(face, u, v, cfg_.surface_sample_resolution);
     if (surface.empty()) {
         plan.detail = "empty_surface";
@@ -259,9 +304,18 @@ mission::CoveragePlan FaceViewpointPlanner::plan(
     const double step_v = std::max(0.3, footprint_h * (1.0 - overlap));
     const double half_w = 0.5 * std::max(face.width, footprint_w);
     const double half_h = 0.5 * std::max(face.height, footprint_h);
+    const int S = static_cast<int>(surface.size());
 
     std::vector<mission::CaptureViewpoint> candidates;
+    std::vector<bool> fov_reachable(static_cast<std::size_t>(S), false);
+    std::vector<bool> incidence_reachable(static_cast<std::size_t>(S), false);
     uint32_t next_id = 1;
+    // A single normal stand-off can be hidden by tunnel ribs or a locally
+    // rough face.  Bracket it with near/far observations; every resulting
+    // camera pose remains subject to the same map safety and visibility
+    // checks below.
+    const std::array<double, 2> standoff_distances{
+            std::max(0.5, 0.75 * d), d};
     // A single lattice leaves edge samples with only one nearly frontal
     // observation.  Add a half-cell staggered lattice so the second image has
     // a meaningful photogrammetric baseline while retaining the requested
@@ -269,80 +323,121 @@ mission::CoveragePlan FaceViewpointPlanner::plan(
     for (int lattice = 0; lattice < 2; ++lattice) {
         const double offset_u = lattice == 0 ? 0.0 : 0.5 * step_u;
         const double offset_v = lattice == 0 ? 0.0 : 0.5 * step_v;
-        for (double ou = -half_w + offset_u; ou <= half_w + 1e-6; ou += step_u) {
-            for (double ov = -half_h + offset_v; ov <= half_h + 1e-6; ov += step_v) {
-            const Eigen::Vector3d aim = face.center + ou * u + ov * v;
-            const Eigen::Vector3d pos = aim + d * n;
-            if (!isKnownFreeSafe(map,
-                                 pos,
-                                 cfg_.safe_radius,
-                                 cfg_.flight_height_min,
-                                 cfg_.flight_height_max)) {
+        const auto u_offsets = makeLatticeAxis(half_w, step_u, offset_u);
+        const auto v_offsets = makeLatticeAxis(half_h, step_v, offset_v);
+        for (const double ou : u_offsets) {
+            if (cfg_.viewpoint_lateral_limit > 0.0 &&
+                std::abs(ou) > cfg_.viewpoint_lateral_limit) {
                 continue;
             }
-            const double yaw = yawFromDirection((aim - pos).normalized());
-            const double pitch = pitchToPoint(pos, aim);
-            const double pitch_deg = pitch * 180.0 / M_PI;
-            if (pitch_deg < cfg_.camera.min_pitch_deg ||
-                pitch_deg > cfg_.camera.max_pitch_deg) {
-                continue;
-            }
+            for (const double ov : v_offsets) {
+                const Eigen::Vector3d aim = face.center + ou * u + ov * v;
+                for (const double standoff : standoff_distances) {
+                // A tall end face commonly extends above the vehicle's
+                // permitted flight band.  Keep the camera in that band and
+                // let its pitch aim at the corresponding surface cell; do
+                // not discard the cell merely because a normal-only camera
+                // pose would share its altitude.
+                Eigen::Vector3d pos = aim + standoff * n;
+                pos.z() = std::clamp(pos.z(), cfg_.viewpoint_height_min,
+                                     cfg_.viewpoint_height_max);
+                if (!isKnownFreeSafe(map,
+                                     pos,
+                                     cfg_.safe_radius,
+                                     cfg_.viewpoint_height_min,
+                                     cfg_.viewpoint_height_max)) {
+                    continue;
+                }
+                const double yaw = yawFromDirection((aim - pos).normalized());
+                const double pitch = pitchToPoint(pos, aim);
+                const double pitch_deg = pitch * 180.0 / M_PI;
+                if (pitch_deg < cfg_.camera.min_pitch_deg ||
+                    pitch_deg > cfg_.camera.max_pitch_deg) {
+                    continue;
+                }
 
-            mission::CaptureViewpoint vp;
-            vp.id = next_id++;
-            vp.position = pos;
-            vp.body_yaw = yaw;
-            vp.camera_pitch = pitch;
-            for (int si = 0; si < static_cast<int>(surface.size()); ++si) {
-                const auto &sp = surface[static_cast<std::size_t>(si)];
-                if (!inFov(pos, yaw, pitch, sp, cfg_.camera)) {
+                mission::CaptureViewpoint vp;
+                vp.id = next_id++;
+                vp.position = pos;
+                vp.body_yaw = yaw;
+                vp.camera_pitch = pitch;
+                for (int si = 0; si < static_cast<int>(surface.size()); ++si) {
+                    const auto &sp = surface[static_cast<std::size_t>(si)];
+                    if (!inFov(pos, yaw, pitch, sp, cfg_.camera)) {
+                        continue;
+                    }
+                    fov_reachable[static_cast<std::size_t>(si)] = true;
+                    if (!incidenceOk(pos, sp, n, cfg_.camera.max_incidence_angle_deg)) {
+                        continue;
+                    }
+                    incidence_reachable[static_cast<std::size_t>(si)] = true;
+                    if (cfg_.use_raw_occlusion_check &&
+                        !rayFreeToFaceSurface(map, pos, sp, n,
+                                              cfg_.unknown_as_occupied)) {
+                        continue;
+                    }
+                    vp.visible_surface_ids.push_back(si);
+                }
+                if (vp.visible_surface_ids.empty()) {
                     continue;
                 }
-                if (!incidenceOk(pos, sp, n, cfg_.camera.max_incidence_angle_deg)) {
-                    continue;
-                }
-                if (!rayFreeToFaceSurface(map, pos, sp, n,
-                                          cfg_.unknown_as_occupied)) {
-                    continue;
-                }
-                vp.visible_surface_ids.push_back(si);
-            }
-            if (vp.visible_surface_ids.empty()) {
-                continue;
-            }
-            vp.expected_coverage_gain =
-                    static_cast<double>(vp.visible_surface_ids.size()) /
-                    static_cast<double>(surface.size());
+                vp.expected_coverage_gain =
+                        static_cast<double>(vp.visible_surface_ids.size()) /
+                        static_cast<double>(surface.size());
                 candidates.push_back(std::move(vp));
+                }
             }
         }
     }
 
     if (candidates.empty()) {
-        // Fallback: single approach-like viewpoint on the face normal.
-        mission::CaptureViewpoint vp;
-        vp.id = 1;
-        vp.position = face.center + d * n;
-        vp.body_yaw = yawFromDirection(-n);
-        vp.camera_pitch = 0.0;
-        for (int si = 0; si < static_cast<int>(surface.size()); ++si) {
-            vp.visible_surface_ids.push_back(si);
-        }
-        if (isKnownFreeSafe(map,
-                            vp.position,
-                            cfg_.safe_radius,
-                            cfg_.flight_height_min,
-                            cfg_.flight_height_max)) {
-            candidates.push_back(vp);
-        } else {
-            plan.detail = "no_feasible_viewpoint";
-            return plan;
-        }
+        plan.detail = "no_feasible_viewpoint";
+        return plan;
     }
 
     const int K = std::max(1, cfg_.min_observation_count);
-    const int S = static_cast<int>(surface.size());
+    const double min_baseline = cfg_.min_baseline_angle_deg * M_PI / 180.0;
+    // Keep availability diagnostics separate from the greedy result.  This
+    // makes it clear whether an incomplete plan is caused by the available
+    // camera geometry or by the set-cover selection itself.
+    std::vector<std::vector<Eigen::Vector3d>> available_view_dirs(
+            static_cast<std::size_t>(S));
+    for (const auto &candidate : candidates) {
+        for (const int sid : candidate.visible_surface_ids) {
+            if (sid < 0 || sid >= S) {
+                continue;
+            }
+            available_view_dirs[static_cast<std::size_t>(sid)].push_back(
+                    (candidate.position - surface[static_cast<std::size_t>(sid)]).normalized());
+        }
+    }
+    int visible_once = 0;
+    int visible_with_baseline = 0;
+    for (const auto &dirs : available_view_dirs) {
+        if (dirs.empty()) {
+            continue;
+        }
+        ++visible_once;
+        bool has_baseline_pair = false;
+        for (std::size_t i = 0; i < dirs.size() && !has_baseline_pair; ++i) {
+            for (std::size_t j = i + 1; j < dirs.size(); ++j) {
+                const double angle = std::acos(std::clamp(dirs[i].dot(dirs[j]), -1.0, 1.0));
+                if (angle >= min_baseline) {
+                    has_baseline_pair = true;
+                    break;
+                }
+            }
+        }
+        if (has_baseline_pair) {
+            ++visible_with_baseline;
+        }
+    }
+    const int fov_visible = static_cast<int>(std::count(fov_reachable.begin(),
+                                                         fov_reachable.end(), true));
+    const int incidence_visible = static_cast<int>(std::count(incidence_reachable.begin(),
+                                                               incidence_reachable.end(), true));
     std::vector<int> cover_count(static_cast<std::size_t>(S), 0);
+    std::vector<int> selected_observation_count(static_cast<std::size_t>(S), 0);
     // A count only advances when the new camera center creates the configured
     // angular baseline to an earlier observation of the same surface point.
     // This prevents two nearly coincident frames from satisfying K-coverage.
@@ -350,8 +445,6 @@ mission::CoveragePlan FaceViewpointPlanner::plan(
             static_cast<std::size_t>(S));
     std::vector<bool> selected(candidates.size(), false);
     std::vector<mission::CaptureViewpoint> chosen;
-    const double min_baseline = cfg_.min_baseline_angle_deg * M_PI / 180.0;
-
     auto uncoveredLeft = [&]() {
         int left = 0;
         for (int c : cover_count) {
@@ -403,8 +496,11 @@ mission::CoveragePlan FaceViewpointPlanner::plan(
         vp.expected_coverage_gain =
                 static_cast<double>(best_gain) / static_cast<double>(S);
         for (const int sid : vp.visible_surface_ids) {
-            if (sid < 0 || sid >= S ||
-                cover_count[static_cast<std::size_t>(sid)] >= K) {
+            if (sid < 0 || sid >= S) {
+                continue;
+            }
+            ++selected_observation_count[static_cast<std::size_t>(sid)];
+            if (cover_count[static_cast<std::size_t>(sid)] >= K) {
                 continue;
             }
             const Eigen::Vector3d view_dir =
@@ -441,19 +537,41 @@ mission::CoveragePlan FaceViewpointPlanner::plan(
     }
 
     int covered_k = 0;
+    int covered_once = 0;
     for (int c : cover_count) {
         if (c >= K) {
             ++covered_k;
         }
     }
-    plan.predicted_coverage =
+    for (int c : selected_observation_count) {
+        if (c > 0) {
+            ++covered_once;
+        }
+    }
+    const double dual_coverage =
             static_cast<double>(covered_k) / static_cast<double>(std::max(1, S));
-    plan.valid = !plan.ordered_viewpoints.empty();
-    plan.detail = plan.valid
-                          ? "ok;candidates=" + std::to_string(candidates.size()) +
-                                    ";views=" + std::to_string(chosen.size()) +
-                                    ";samples=" + std::to_string(surface.size())
-                          : "empty";
+    const double primary_coverage =
+            static_cast<double>(covered_once) / static_cast<double>(std::max(1, S));
+    const bool use_boundary_single_view =
+            cfg_.allow_single_view_boundary_coverage && covered_once == S;
+    plan.predicted_coverage = use_boundary_single_view ? primary_coverage : dual_coverage;
+    const double required_coverage =
+            std::clamp(cfg_.required_coverage_ratio, 0.0, 1.0);
+    plan.valid = !plan.ordered_viewpoints.empty() &&
+                 plan.predicted_coverage + 1e-9 >= required_coverage;
+    plan.detail = (plan.valid ? "ok" : "coverage_incomplete") +
+                  std::string(";candidates=") + std::to_string(candidates.size()) +
+                  ";views=" + std::to_string(chosen.size()) +
+                  ";samples=" + std::to_string(surface.size()) +
+                  ";covered=" + std::to_string(covered_k) +
+                  ";single_covered=" + std::to_string(covered_once) +
+                  ";dual_coverage=" + std::to_string(dual_coverage) +
+                  ";boundary_single_view=" +
+                  std::to_string(use_boundary_single_view ? 1 : 0) +
+                  ";fov_visible=" + std::to_string(fov_visible) +
+                  ";incidence_visible=" + std::to_string(incidence_visible) +
+                  ";visible_once=" + std::to_string(visible_once) +
+                  ";baseline_available=" + std::to_string(visible_with_baseline);
     return plan;
 }
 

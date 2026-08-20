@@ -229,11 +229,14 @@ struct FaceObservation {
     bool valid{false};
     Eigen::Vector3d center;
     Eigen::Vector3d normal;
+    Eigen::Vector3d tangent_u;
+    Eigen::Vector3d tangent_v;
     pcl::PointCloud<pcl::PointXYZ>::Ptr surface_cloud;
     double width{0.0};
     double height{0.0};
     double area{0.0};
     double confidence{0.0};
+    bool extent_complete{false};
 };
 ```
 
@@ -246,7 +249,8 @@ struct FaceObservation {
   → 按隧道前进方向截取前方 ROI
   → 体素降采样、统计离群点移除
   → 欧式聚类
-  → 每个聚类执行 RANSAC 平面拟合 + PCA
+  → 每个聚类执行 RANSAC 平面拟合，取得局部法向种子
+  → 以该法向从完整 ROI 扩展端面支持点，计算统一 u-v 坐标系的矩形外接范围
   → 按方向、面积、平面性、密度、前方位置打分
   → 多帧一致性确认
   → FaceObservation
@@ -271,6 +275,11 @@ tunnel_dir = [cos(active_target.goal_yaw), sin(active_target.goal_yaw), 0]
 - PCA 平面残差较小；
 - 不是侧壁、顶板、地面或局部设备；
 - 连续多帧的中心、法向稳定。
+- 支持点不得触及 ROI 边界；触及即返回 `face_extent_clipped`，不允许对被截断
+  的局部面片生成覆盖任务。默认任务会使用该候选的中心与朝向自由空间的法向，搜索
+  一个经地图安全检查的居中观察位并复检一次：
+  `WAIT_FACE_RESULT → GO_TO_FACE_RECENTER → WAIT_FACE_RESULT`。第二次仍裁剪、
+  无安全观察位或重定位导航失败时才返航，且不写回目标文件。
 
 法向统一指向无人机/自由空间：
 
@@ -379,6 +388,10 @@ visible(i, j) =
 ```text
 当前无人机位置 → 所有视点 → Home
 ```
+
+覆盖采样必须来自上述完整 `width × height` 矩形的规则网格，且显式包含四条边和
+四个角；不能以稀疏 LiDAR 支持点的数量作为覆盖率分母。默认任务要求每个网格点达到
+`K` 次、满足基线约束的有效观测（`min_predicted_coverage: 1.0`）。
 
 视点数较少时，最近邻初始化加 2-opt 局部优化足够；若附近障碍复杂，可使用局部路径长度替代欧氏距离。
 
@@ -643,6 +656,10 @@ inspection_mission:
     # mission_target; this prevents a far tunnel wall from becoming the face.
     prior_center_tolerance: 3.0
     prior_normal_alignment_min: 0.9
+    # A cropped support can be re-observed once from a face-centred, safe
+    # stand-off pose.  It is never itself eligible for coverage planning.
+    recenter_on_clipped: true
+    recenter_max_attempts: 1
 
   coverage:
     camera_hfov_deg: 70.0
@@ -685,8 +702,10 @@ rostopic echo /inspection/viewpoints
 ```
 
 验收时记录 `/inspection/face/debug` 的 `center`、`normal`、`area`、`confidence`
-和 `surface_cloud` 点数，并核对状态顺序为 `WAIT_FACE_RESULT → PLAN_VIEWS →
-GO_TO_VIEWPOINT → RETURN_HOME → FINISHED`。该配置的 `mock_capture: true` 会让完整
+和 `surface_cloud` 点数。若首个观察位完整，状态顺序为 `WAIT_FACE_RESULT → PLAN_VIEWS →
+GO_TO_VIEWPOINT → RETURN_HOME → FINISHED`；若日志出现 `face_extent_clipped`，应先看到
+`GO_TO_FACE_RECENTER → WAIT_FACE_RESULT(request_face_after_recenter)`，且裁剪结果本身
+不会发布视点。该配置的 `mock_capture: true` 会让完整
 任务在视点到达后继续执行并覆盖写回**仿真专用** target 文件；若要反复使用同一初始
 先验，在每轮实验前从版本库还原该文件。
 

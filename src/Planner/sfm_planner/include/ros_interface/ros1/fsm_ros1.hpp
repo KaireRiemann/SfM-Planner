@@ -911,10 +911,16 @@ namespace fsm {
             if (obs.normal.norm() > 1e-6) {
                 obs.normal.normalize();
             }
+            obs.tangent_u = Eigen::Vector3d(msg->tangent_u.x, msg->tangent_u.y,
+                                             msg->tangent_u.z);
+            obs.tangent_v = Eigen::Vector3d(msg->tangent_v.x, msg->tangent_v.y,
+                                             msg->tangent_v.z);
             obs.width = msg->width;
             obs.height = msg->height;
             obs.area = msg->area;
             obs.confidence = msg->confidence;
+            obs.extent_complete = msg->extent_complete;
+            obs.extent_detail = msg->extent_detail;
             obs.surface_cloud.reset(new pcl::PointCloud<pcl::PointXYZ>());
             if (!msg->surface_cloud.data.empty()) {
                 pcl::fromROSMsg(msg->surface_cloud, *obs.surface_cloud);
@@ -947,13 +953,16 @@ namespace fsm {
             pcl::fromROSMsg(*msg, *cloud);
             const auto mission_context = inspection_mission_->context();
             const auto &active = mission_context.active_target;
-            // The approach goal is the operator's initial observation anchor.
-            // Its yaw, rather than a face from a previous inspection, defines
-            // the first detection ROI.  Otherwise a persisted old face can
-            // make a newly triggered mission search in the wrong direction.
-            Eigen::Vector3d tunnel_dir(std::cos(active.goal_yaw),
-                                       std::sin(active.goal_yaw), 0.0);
-            if (!std::isfinite(active.goal_yaw) || tunnel_dir.norm() < 1e-6) {
+            // The ROI follows the yaw at which the current observation pose
+            // was actually reached.  This is normally the manual approach
+            // yaw, but becomes the detected face normal after an automatic
+            // recenter retry; using active.goal_yaw there would retain the
+            // original, off-centre frame.
+            const double roi_yaw = std::isfinite(mission_context.last_navigation_pose.yaw)
+                                           ? mission_context.last_navigation_pose.yaw
+                                           : active.goal_yaw;
+            Eigen::Vector3d tunnel_dir(std::cos(roi_yaw), std::sin(roi_yaw), 0.0);
+            if (!std::isfinite(roi_yaw) || tunnel_dir.norm() < 1e-6) {
                 tunnel_dir = Eigen::Vector3d::UnitX();
             }
             const Eigen::Vector3d robot(robot_state_.p.x(), robot_state_.p.y(),
@@ -973,7 +982,11 @@ namespace fsm {
                             : nullptr;
             auto obs = face_detector_->process(cloud, robot, tunnel_dir,
                                                prior_center, prior_normal);
-            if (!obs.valid) {
+            // Ordinary unsuccessful frames are accumulated until the detector
+            // becomes stable.  A non-empty detail is a terminal geometric
+            // rejection (for example the full face touches the ROI boundary)
+            // and must be passed to the mission immediately.
+            if (!obs.valid && obs.extent_detail.empty()) {
                 return;
             }
             obs.mission_id = active_face_request_.mission_id;
@@ -992,10 +1005,18 @@ namespace fsm {
                 debug.normal.x = obs.normal.x();
                 debug.normal.y = obs.normal.y();
                 debug.normal.z = obs.normal.z();
+                debug.tangent_u.x = obs.tangent_u.x();
+                debug.tangent_u.y = obs.tangent_u.y();
+                debug.tangent_u.z = obs.tangent_u.z();
+                debug.tangent_v.x = obs.tangent_v.x();
+                debug.tangent_v.y = obs.tangent_v.y();
+                debug.tangent_v.z = obs.tangent_v.z();
                 debug.width = obs.width;
                 debug.height = obs.height;
                 debug.area = obs.area;
                 debug.confidence = obs.confidence;
+                debug.extent_complete = obs.extent_complete;
+                debug.extent_detail = obs.extent_detail;
                 if (obs.surface_cloud && !obs.surface_cloud->empty()) {
                     pcl::toROSMsg(*obs.surface_cloud, debug.surface_cloud);
                     debug.surface_cloud.header = msg->header;
@@ -1080,12 +1101,24 @@ namespace fsm {
                 return;
             }
             normal.normalize();
-            Eigen::Vector3d reference = Eigen::Vector3d::UnitZ();
-            if (std::abs(normal.dot(reference)) > 0.95) {
-                reference = Eigen::Vector3d::UnitY();
+            Eigen::Vector3d u = face.tangent_u -
+                                face.tangent_u.dot(normal) * normal;
+            Eigen::Vector3d v;
+            if (u.norm() > 1e-6) {
+                u.normalize();
+                v = normal.cross(u).normalized();
+                if (face.tangent_v.norm() > 1e-6 && face.tangent_v.dot(v) < 0.0) {
+                    u = -u;
+                    v = -v;
+                }
+            } else {
+                Eigen::Vector3d reference = Eigen::Vector3d::UnitZ();
+                if (std::abs(normal.dot(reference)) > 0.95) {
+                    reference = Eigen::Vector3d::UnitY();
+                }
+                u = reference.cross(normal).normalized();
+                v = normal.cross(u).normalized();
             }
-            const Eigen::Vector3d u = reference.cross(normal).normalized();
-            const Eigen::Vector3d v = normal.cross(u).normalized();
             const double half_width = 0.5 * std::max(0.0, face.width);
             const double half_height = 0.5 * std::max(0.0, face.height);
             const Eigen::Vector3d c0 = face.center - half_width * u - half_height * v;
@@ -1784,6 +1817,14 @@ namespace fsm {
                     det_cfg.cluster_tolerance = cfg_.inspection_mission.face_cluster_tolerance;
                     det_cfg.cluster_min_size = cfg_.inspection_mission.face_cluster_min_size;
                     det_cfg.ransac_dist = cfg_.inspection_mission.face_ransac_dist;
+                    det_cfg.lateral_half_width =
+                            cfg_.inspection_mission.face_lateral_half_width;
+                    det_cfg.vertical_half_height =
+                            cfg_.inspection_mission.face_vertical_half_height;
+                    det_cfg.roi_edge_margin = cfg_.inspection_mission.face_roi_edge_margin;
+                    det_cfg.support_plane_distance =
+                            cfg_.inspection_mission.face_support_plane_distance;
+                    det_cfg.extent_padding = cfg_.inspection_mission.face_extent_padding;
                     det_cfg.prior_center_tolerance =
                             cfg_.inspection_mission.face_prior_center_tolerance;
                     det_cfg.prior_normal_alignment_min =
