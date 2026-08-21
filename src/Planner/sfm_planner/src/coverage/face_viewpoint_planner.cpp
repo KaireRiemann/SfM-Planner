@@ -260,6 +260,150 @@ std::vector<int> orderByNn2Opt(const std::vector<mission::CaptureViewpoint> &vie
     return order;
 }
 
+struct TransitionBridgeResult {
+    std::vector<mission::CaptureViewpoint> viewpoints;
+    int candidate_bridges{0};
+    int synthetic_bridges{0};
+    int unresolved_transitions{0};
+    double longest_transition{0.0};
+};
+
+TransitionBridgeResult bridgeLongCaptureTransitions(
+        const std::vector<mission::CaptureViewpoint> &ordered,
+        const std::vector<mission::CaptureViewpoint> &candidates,
+        const mission::FaceObservation &face,
+        const general_planner::MapManager &map,
+        const FaceViewpointPlanner::Config &cfg) {
+    TransitionBridgeResult result;
+    if (ordered.empty()) {
+        return result;
+    }
+
+    result.viewpoints.reserve(ordered.size());
+    result.viewpoints.push_back(ordered.front());
+    const double preferred_distance = cfg.preferred_capture_transition_distance;
+    const int bridge_limit = std::max(0, cfg.max_transition_bridge_viewpoints);
+    if (preferred_distance <= 1e-3 || bridge_limit <= 0 || ordered.size() < 2) {
+        for (std::size_t i = 1; i < ordered.size(); ++i) {
+            result.viewpoints.push_back(ordered[i]);
+        }
+        return result;
+    }
+
+    std::vector<bool> candidate_used(candidates.size(), false);
+    uint32_t next_synthetic_id = 1;
+    for (const auto &candidate : candidates) {
+        next_synthetic_id = std::max(next_synthetic_id, candidate.id + 1U);
+    }
+    for (const auto &view : ordered) {
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            if (candidates[i].id == view.id) {
+                candidate_used[i] = true;
+                break;
+            }
+        }
+    }
+
+    auto bestBridgeCandidate = [&](const mission::CaptureViewpoint &from,
+                                   const mission::CaptureViewpoint &to) {
+        const double direct_distance = (to.position - from.position).norm();
+        int best_index = -1;
+        double best_score = std::numeric_limits<double>::infinity();
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            if (candidate_used[i] || !candidates[i].position.allFinite()) {
+                continue;
+            }
+            const double from_distance = (candidates[i].position - from.position).norm();
+            const double to_distance = (to.position - candidates[i].position).norm();
+            if (from_distance < 0.15 || from_distance > preferred_distance + 1e-6 ||
+                to_distance >= direct_distance - 0.05) {
+                continue;
+            }
+            // Prefer a balanced split first; a short first leg keeps the
+            // executed sequence locally continuous even when several bridges
+            // are needed for the remaining distance.
+            const double score = std::max(from_distance, to_distance) +
+                                 0.01 * (from_distance + to_distance);
+            if (score < best_score) {
+                best_score = score;
+                best_index = static_cast<int>(i);
+            }
+        }
+        return best_index;
+    };
+
+    Eigen::Vector3d face_normal = face.normal;
+    if (face_normal.norm() > 1e-6) {
+        face_normal.normalize();
+    }
+    for (std::size_t target_index = 1; target_index < ordered.size(); ++target_index) {
+        const auto &target = ordered[target_index];
+        bool unresolved = false;
+        while ((target.position - result.viewpoints.back().position).norm() >
+               preferred_distance + 1e-6) {
+            const int bridges_used = result.candidate_bridges + result.synthetic_bridges;
+            if (bridges_used >= bridge_limit) {
+                unresolved = true;
+                break;
+            }
+
+            const int candidate_index = bestBridgeCandidate(result.viewpoints.back(), target);
+            if (candidate_index >= 0) {
+                candidate_used[static_cast<std::size_t>(candidate_index)] = true;
+                result.viewpoints.push_back(
+                        candidates[static_cast<std::size_t>(candidate_index)]);
+                ++result.candidate_bridges;
+                continue;
+            }
+
+            const auto &from = result.viewpoints.back();
+            const Eigen::Vector3d delta = target.position - from.position;
+            const double direct_distance = delta.norm();
+            if (!delta.allFinite() || direct_distance <= preferred_distance + 1e-6 ||
+                face_normal.norm() < 1e-6) {
+                unresolved = true;
+                break;
+            }
+            const Eigen::Vector3d bridge_position =
+                    from.position + (preferred_distance / direct_distance) * delta;
+            if (!isKnownFreeSafe(map, bridge_position, cfg.safe_radius,
+                                 cfg.viewpoint_height_min, cfg.viewpoint_height_max)) {
+                unresolved = true;
+                break;
+            }
+
+            mission::CaptureViewpoint bridge;
+            bridge.id = next_synthetic_id++;
+            bridge.position = bridge_position;
+            bridge.body_yaw = yawFromDirection(face.center - bridge.position);
+            bridge.camera_pitch = pitchToPoint(bridge.position, face.center);
+            const double pitch_deg = bridge.camera_pitch * 180.0 / M_PI;
+            if (pitch_deg < cfg.camera.min_pitch_deg ||
+                pitch_deg > cfg.camera.max_pitch_deg ||
+                !inFov(bridge.position, bridge.body_yaw, bridge.camera_pitch,
+                       face.center, cfg.camera) ||
+                !incidenceOk(bridge.position, face.center, face_normal,
+                             cfg.camera.max_incidence_angle_deg)) {
+                unresolved = true;
+                break;
+            }
+            result.viewpoints.push_back(std::move(bridge));
+            ++result.synthetic_bridges;
+        }
+        if (unresolved) {
+            ++result.unresolved_transitions;
+        }
+        result.viewpoints.push_back(target);
+    }
+
+    for (std::size_t i = 1; i < result.viewpoints.size(); ++i) {
+        result.longest_transition = std::max(
+                result.longest_transition,
+                (result.viewpoints[i].position - result.viewpoints[i - 1].position).norm());
+    }
+    return result;
+}
+
 }  // namespace
 
 FaceViewpointPlanner::FaceViewpointPlanner(Config config) : cfg_(std::move(config)) {}
@@ -531,10 +675,14 @@ mission::CoveragePlan FaceViewpointPlanner::plan(
     }
 
     const auto order = orderByNn2Opt(chosen, current_position, home);
-    plan.ordered_viewpoints.reserve(order.size());
+    std::vector<mission::CaptureViewpoint> coverage_order;
+    coverage_order.reserve(order.size());
     for (const int idx : order) {
-        plan.ordered_viewpoints.push_back(chosen[static_cast<std::size_t>(idx)]);
+        coverage_order.push_back(chosen[static_cast<std::size_t>(idx)]);
     }
+    const auto bridge_result = bridgeLongCaptureTransitions(
+            coverage_order, candidates, face, map, cfg_);
+    plan.ordered_viewpoints = bridge_result.viewpoints;
 
     int covered_k = 0;
     int covered_once = 0;
@@ -561,7 +709,13 @@ mission::CoveragePlan FaceViewpointPlanner::plan(
                  plan.predicted_coverage + 1e-9 >= required_coverage;
     plan.detail = (plan.valid ? "ok" : "coverage_incomplete") +
                   std::string(";candidates=") + std::to_string(candidates.size()) +
-                  ";views=" + std::to_string(chosen.size()) +
+                  ";views=" + std::to_string(plan.ordered_viewpoints.size()) +
+                  ";coverage_views=" + std::to_string(chosen.size()) +
+                  ";candidate_bridges=" + std::to_string(bridge_result.candidate_bridges) +
+                  ";synthetic_bridges=" + std::to_string(bridge_result.synthetic_bridges) +
+                  ";unresolved_transitions=" +
+                  std::to_string(bridge_result.unresolved_transitions) +
+                  ";longest_transition=" + std::to_string(bridge_result.longest_transition) +
                   ";samples=" + std::to_string(surface.size()) +
                   ";covered=" + std::to_string(covered_k) +
                   ";single_covered=" + std::to_string(covered_once) +

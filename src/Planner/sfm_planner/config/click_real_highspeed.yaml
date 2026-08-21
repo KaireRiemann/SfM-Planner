@@ -15,6 +15,10 @@ fsm:
   perception_replan_min_interval: 0.08
   perception_replan_consecutive_hits: 1
   perception_replan_emergency_horizon: 0.45
+  # State2state replan is detached from the FSM lock. A non-returning call
+  # enters terminal emergency hold rather than starving FOLLOW/GENERATE_TRAJ.
+  # Keep this above the 0.35 s frontend A* budget to avoid ordinary timeouts.
+  state2state_replan_timeout_sec: 1.0
 
 general_planner:
   backup_traj_en: true

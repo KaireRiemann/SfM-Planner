@@ -53,6 +53,10 @@ InspectionMissionPlanner::InspectionMissionPlanner(
     vp_cfg.viewpoint_height_max = cfg_.camera_viewpoint_height_max;
     vp_cfg.viewpoint_lateral_limit = cfg_.camera_viewpoint_lateral_limit;
     vp_cfg.max_viewpoints = cfg_.max_viewpoints;
+    vp_cfg.preferred_capture_transition_distance =
+            cfg_.preferred_capture_transition_distance;
+    vp_cfg.max_transition_bridge_viewpoints =
+            cfg_.max_transition_bridge_viewpoints;
     viewpoint_planner_ = std::make_shared<coverage::FaceViewpointPlanner>(vp_cfg);
 }
 
@@ -400,6 +404,20 @@ void InspectionMissionPlanner::cancel(const std::string &reason) {
     ctx_.has_pending_target = false;
     ctx_.has_pending_face_observation = false;
     returnHome();
+}
+
+void InspectionMissionPlanner::abort(const std::string &reason) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (state_ == InspectionState::IDLE || state_ == InspectionState::FINISHED ||
+        state_ == InspectionState::FAILED) {
+        return;
+    }
+    // cancel() routes through Home. A watchdog can run while the low-level
+    // planner owns its replan mutex, so it must not enqueue another nav leg.
+    ctx_.failure_reason = reason.empty() ? "aborted" : reason;
+    ctx_.has_pending_target = false;
+    ctx_.has_pending_face_observation = false;
+    setState(InspectionState::FAILED, ctx_.failure_reason);
 }
 
 void InspectionMissionPlanner::tick() {

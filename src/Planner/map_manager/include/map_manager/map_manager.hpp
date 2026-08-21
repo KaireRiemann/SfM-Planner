@@ -352,6 +352,23 @@ public:
                                          attach_radius);
     }
 
+    /** Return only through map-verified executed history, never via skeleton shortcuts. */
+    bool findExecutedTopologyHistoryPath(
+        const IncrementalTopologyGraph::SearchSnapshotPtr &snapshot,
+        const rog_map::Vec3f &start,
+        const rog_map::Vec3f &goal,
+        rog_map::vec_Vec3f &path,
+        const double attach_radius = 0.0) const
+    {
+        if (!map_ || !topologyReady() || !snapshot) {
+            path.clear();
+            return false;
+        }
+        syncBoundaryMap();
+        return topology_graph_->findExecutedHistoryPath(
+            snapshot, start, goal, makeTopologyQuery(), path, attach_radius);
+    }
+
     rog_map::RobotState getRobotState() const
     {
         return map_->getRobotState();

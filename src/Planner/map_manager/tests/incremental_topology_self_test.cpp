@@ -125,8 +125,14 @@ int main() {
     history_graph.appendExecutedPathHistory(
         {home, Vec3f(2.5, 0.5, 0.5), Vec3f(4.5, 0.5, 0.5), current});
     path.clear();
-    ok &= expect(history_graph.findPath(current, home, history_query, path),
-                 "executed odometry chain must guarantee a return A* path");
+    ok &= expect(history_graph.findExecutedHistoryPath(
+                     history_graph.acquireSearchSnapshot(), current, home,
+                     history_query, path),
+                 "executed odometry chain must guarantee a history-only return path");
+    ok &= expect(path.size() == 4 &&
+                     (path[1] - Vec3f(4.5, 0.5, 0.5)).norm() < 1.0e-9 &&
+                     (path[2] - Vec3f(2.5, 0.5, 0.5)).norm() < 1.0e-9,
+                 "history-only return must preserve the flown backbone order");
     const auto history_stats = history_graph.stats();
     ok &= expect(history_stats.executed_history_node_count == 4 &&
                      history_stats.executed_history_edge_count == 3,

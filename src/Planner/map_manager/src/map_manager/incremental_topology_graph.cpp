@@ -1856,6 +1856,154 @@ bool IncrementalTopologyGraph::findPath(const rog_map::Vec3f &start,
                     path, attach_radius);
 }
 
+bool IncrementalTopologyGraph::findExecutedHistoryPath(
+    const SearchSnapshotPtr &snapshot,
+    const rog_map::Vec3f &start,
+    const rog_map::Vec3f &goal,
+    const TopologyMapView &map_view,
+    rog_map::vec_Vec3f &path,
+    double attach_radius) const {
+    path.clear();
+    if (!active() || !snapshot || !start.allFinite() || !goal.allFinite() ||
+        !map_view.isTraversable(start) ||
+        snapshot->executed_history_nodes.empty()) {
+        return false;
+    }
+    const auto &graph = snapshot->graph;
+    const Config &query_config = snapshot->config;
+    const double goal_tolerance = std::max(1.0e-6,
+                                           query_config.edge_sample_spacing);
+    attach_radius = attach_radius > 0.0
+        ? attach_radius : query_config.connection_radius;
+
+    // Home may be outside the rolling local map. It remains a valid goal only
+    // when it is exactly anchored in the immutable executed-history chain.
+    std::unordered_map<NodeId, double> goal_links;
+    for (const NodeId id : snapshot->executed_history_nodes) {
+        const auto node = graph.find(id);
+        if (node == graph.end()) {
+            continue;
+        }
+        const double distance = (node->second.node.position - goal).norm();
+        if (distance <= goal_tolerance) {
+            goal_links.emplace(id, distance);
+        }
+    }
+    if (goal_links.empty()) {
+        return false;
+    }
+    if ((goal - start).norm() <= goal_tolerance) {
+        path = {start, goal};
+        return true;
+    }
+
+    std::vector<std::pair<double, NodeId>> start_candidates;
+    start_candidates.reserve(snapshot->executed_history_nodes.size());
+    for (const NodeId id : snapshot->executed_history_nodes) {
+        const auto node = graph.find(id);
+        if (node == graph.end()) {
+            continue;
+        }
+        const double distance = (node->second.node.position - start).norm();
+        if (distance <= attach_radius &&
+            lineTraversable(start, node->second.node.position, map_view,
+                            query_config.edge_sample_spacing)) {
+            start_candidates.emplace_back(distance, id);
+        }
+    }
+    if (start_candidates.empty()) {
+        return false;
+    }
+
+    struct QueueEntry {
+        double path_cost{0.0};
+        NodeId node_id{0};
+    };
+    const auto lowerCost = [](const QueueEntry &lhs, const QueueEntry &rhs) {
+        if (std::abs(lhs.path_cost - rhs.path_cost) > 1.0e-12) {
+            return lhs.path_cost > rhs.path_cost;
+        }
+        return lhs.node_id > rhs.node_id;
+    };
+    std::priority_queue<QueueEntry, std::vector<QueueEntry>,
+                        decltype(lowerCost)> queue(lowerCost);
+    std::unordered_map<NodeId, double> distance;
+    std::unordered_map<NodeId, NodeId> parent;
+    for (const auto &candidate : start_candidates) {
+        const auto known = distance.find(candidate.second);
+        if (known == distance.end() || candidate.first < known->second) {
+            distance[candidate.second] = candidate.first;
+            parent[candidate.second] = 0;
+            queue.push({candidate.first, candidate.second});
+        }
+    }
+
+    double best_goal_cost = std::numeric_limits<double>::infinity();
+    NodeId best_goal_id = 0;
+    while (!queue.empty()) {
+        const QueueEntry current = queue.top();
+        queue.pop();
+        const auto known = distance.find(current.node_id);
+        if (known == distance.end() ||
+            current.path_cost > known->second + 1.0e-12 ||
+            current.path_cost >= best_goal_cost) {
+            continue;
+        }
+        const auto goal_it = goal_links.find(current.node_id);
+        if (goal_it != goal_links.end() &&
+            current.path_cost + goal_it->second < best_goal_cost) {
+            best_goal_cost = current.path_cost + goal_it->second;
+            best_goal_id = current.node_id;
+        }
+        const auto node = graph.find(current.node_id);
+        if (node == graph.end()) {
+            continue;
+        }
+        for (const auto &neighbor : node->second.neighbors) {
+            // Never cross from the executed chain into the topology skeleton.
+            if (snapshot->executed_history_nodes.count(neighbor.first) == 0U ||
+                graph.count(neighbor.first) == 0U) {
+                continue;
+            }
+            const double proposed = current.path_cost + neighbor.second;
+            const auto existing = distance.find(neighbor.first);
+            if (existing == distance.end() || proposed < existing->second) {
+                distance[neighbor.first] = proposed;
+                parent[neighbor.first] = current.node_id;
+                queue.push({proposed, neighbor.first});
+            }
+        }
+    }
+    if (best_goal_id == 0) {
+        return false;
+    }
+
+    std::vector<NodeId> reverse_ids;
+    for (NodeId id = best_goal_id; id != 0;) {
+        reverse_ids.push_back(id);
+        const auto parent_it = parent.find(id);
+        if (parent_it == parent.end()) {
+            return false;
+        }
+        id = parent_it->second;
+    }
+    path.push_back(start);
+    for (auto it = reverse_ids.rbegin(); it != reverse_ids.rend(); ++it) {
+        const auto node = graph.find(*it);
+        if (node == graph.end()) {
+            path.clear();
+            return false;
+        }
+        if (path.empty() || !samePosition(path.back(), node->second.node.position)) {
+            path.push_back(node->second.node.position);
+        }
+    }
+    if (path.empty() || !samePosition(path.back(), goal)) {
+        path.push_back(goal);
+    }
+    return path.size() >= 2;
+}
+
 bool IncrementalTopologyGraph::findPath(
     const SearchSnapshotPtr &snapshot,
     const rog_map::Vec3f &start,

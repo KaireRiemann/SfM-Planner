@@ -268,6 +268,17 @@ public:
                   const TopologyMapView &map_view,
                   rog_map::vec_Vec3f &path,
                   double attach_radius = 0.0) const;
+    /**
+     * Query only the mission's verified executed-motion backbone. This is
+     * deliberately separate from findPath(): a sparse topology shortcut is
+     * useful for exploration, but must not replace a proven return corridor.
+     */
+    bool findExecutedHistoryPath(const SearchSnapshotPtr &snapshot,
+                                 const rog_map::Vec3f &start,
+                                 const rog_map::Vec3f &goal,
+                                 const TopologyMapView &map_view,
+                                 rog_map::vec_Vec3f &path,
+                                 double attach_radius = 0.0) const;
 
 private:
     struct RegionKey {

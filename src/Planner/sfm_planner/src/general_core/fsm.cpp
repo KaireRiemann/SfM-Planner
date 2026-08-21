@@ -640,17 +640,36 @@ namespace fsm {
         }
         struct State2StateReplanGuard {
             std::atomic<bool> &in_progress;
+            std::atomic<double> &started_at;
+            std::atomic<std::uint64_t> &running_id;
             bool active;
             ~State2StateReplanGuard() {
                 if (active) {
+                    started_at.store(-1.0, std::memory_order_release);
+                    running_id.store(0, std::memory_order_release);
                     in_progress.store(false);
                 }
             }
         } replan_guard{state2state_replan_in_progress_,
+                       state2state_replan_started_at_,
+                       state2state_replan_running_id_,
                        release_fsm_lock_during_replan};
 
         TimeConsuming replan_once_time("replan_once_time", false);
         active_replan_id_ = next_replan_id_++;
+        if (release_fsm_lock_during_replan) {
+            const double started_at = ros_ptr_->getSimTime();
+            state2state_replan_started_at_.store(started_at,
+                                                  std::memory_order_release);
+            state2state_replan_running_id_.store(active_replan_id_,
+                                                  std::memory_order_release);
+            state2state_replan_timeout_latched_.store(false,
+                                                       std::memory_order_release);
+            recordDiagnosticEvent(
+                "INFO", "state2state_replan_watchdog_armed",
+                fmt::format("timeout_sec={:.3f};started_at={:.3f}",
+                            cfg_.state2state_replan_timeout_sec, started_at));
+        }
         const bool perception_replan_trigger = perception_replan_requested_;
         const bool perception_replan_emergency = perception_replan_emergency_;
         const auto perception_report = perception_replan_report_;
@@ -688,6 +707,18 @@ namespace fsm {
         PlanResult plan_result = executor.replan(*this, replan_request);
         if (release_fsm_lock_during_replan) {
             tick_lock.lock();
+        }
+        // The main FSM may have timed this invocation out while the planner
+        // was outside its mutex.  A late commit would resurrect a trajectory
+        // after the vehicle has entered terminal safety hold.
+        if (release_fsm_lock_during_replan &&
+            state2state_replan_timeout_latched_.load(std::memory_order_acquire)) {
+            recordDiagnosticEvent(
+                "ERROR", "state2state_replan_late_result_discarded",
+                fmt::format("running_replan_id={};ret={};terminal_hold=1",
+                            active_replan_id_, retCodeName(plan_result.ret_code)),
+                plan_result.ret_code);
+            return;
         }
         const TaskPlanContext &replan_context = plan_result.context;
         const RET_CODE ret_code = static_cast<RET_CODE>(plan_result.ret_code);
@@ -995,6 +1026,14 @@ namespace fsm {
         }
         if (inspection_mission_) {
             inspection_mission_->tick();
+        }
+
+        // In real flight a previous command may remain executable for a
+        // while after its rolling replan stalls. Do not wait for that command
+        // to expire before enforcing the replan deadline: the watchdog must
+        // be effective in FOLLOW_TRAJ as well as GENERATE_TRAJ.
+        if (handleState2StateReplanWatchdog()) {
+            return;
         }
 
 
@@ -1331,14 +1370,42 @@ namespace fsm {
                                                       retcode);
                                 if (inspection_navigation_failed && inspection_mission_ &&
                                     inspection_mission_->active()) {
+                                    const auto failed_role = active_navigation_role_;
                                     inspection_mission_->onNavigationFailed(
-                                            active_navigation_role_,
+                                            failed_role,
                                             fmt::format("navigation_plan_failed:{}",
                                                         retCodeName(retcode)));
                                     // The mission owns the failure transition:
                                     // non-home legs return home, while a failed
                                     // home leg becomes terminal.
                                     resetState2StatePlanFromRestFailure();
+                                    if (!inspection_mission_->active()) {
+                                        // A terminal mission callback used to leave the
+                                        // HOME goal queued in GENERATE_TRAJ. That made a
+                                        // failed return re-enter the exact same planning
+                                        // loop immediately, even after publishing FAILED.
+                                        gi_.new_goal = false;
+                                        task_new_ = false;
+                                        started_ = false;
+                                        plan_from_rest_ = false;
+                                        finish_plan = true;
+                                        active_navigation_role_ =
+                                                mission::NavigationRole::EXTERNAL_CLICK;
+                                        applyInspectionMotionProfile(
+                                                mission::NavigationRole::EXTERNAL_CLICK);
+                                        applyInspectionTopologyPolicy(
+                                                mission::NavigationRole::EXTERNAL_CLICK);
+                                        recordDiagnosticEvent(
+                                                "ERROR",
+                                                "inspection_navigation_terminal_failure",
+                                                fmt::format(
+                                                        "role={};ret={};goal_cleared=1",
+                                                        mission::toString(failed_role),
+                                                        retCodeName(retcode)),
+                                                retcode);
+                                        ChangeState("InspectionNavigationFailure",
+                                                    WAIT_GOAL);
+                                    }
                                     break;
                                 }
                                 if (inspection_navigation_failed) {
@@ -1399,6 +1466,13 @@ namespace fsm {
                 break;
             }
             case EMER_STOP: {
+                // A timed-out replan may still be inside GeneralPlanner. Keep
+                // publishing the terminal point/heartbeat rather than falling
+                // through to WAIT_GOAL and accidentally starting new work.
+                if (state2state_replan_timeout_terminal_.load(
+                        std::memory_order_acquire)) {
+                    return;
+                }
                 ChangeState("MainFsmCallback", WAIT_GOAL);
                 break;
             }
@@ -1411,6 +1485,47 @@ namespace fsm {
         state2state_plan_from_rest_fail_count_ = 0;
         state2state_plan_from_rest_fail_start_time_ = -1.0;
         state2state_plan_from_rest_retry_after_ = -1.0;
+    }
+
+    bool Fsm::handleState2StateReplanWatchdog() {
+        if (!state2stateMode() ||
+            !state2state_replan_in_progress_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        const double started_at = state2state_replan_started_at_.load(
+                std::memory_order_acquire);
+        const double timeout = std::max(0.0, cfg_.state2state_replan_timeout_sec);
+        const double now = ros_ptr_->getSimTime();
+        if (timeout <= 0.0 || started_at < 0.0 || now < started_at ||
+            now - started_at < timeout) {
+            return false;
+        }
+
+        if (!state2state_replan_timeout_latched_.exchange(
+                true, std::memory_order_acq_rel)) {
+            const std::uint64_t running_id = state2state_replan_running_id_.load(
+                    std::memory_order_acquire);
+            // Do not clear state2state_replan_in_progress_ here: the old call
+            // may still own GeneralPlanner's replan lock. Starting another
+            // planner call would race its late trajectory commit.
+            state2state_replan_timeout_terminal_.store(true,
+                                                        std::memory_order_release);
+            if (inspection_mission_ && inspection_mission_->active()) {
+                inspection_mission_->abort(fmt::format(
+                        "state2state_replan_timeout:id={};elapsed_sec={:.3f}",
+                        running_id, now - started_at));
+            }
+            recordDiagnosticEvent(
+                    "ERROR", "state2state_replan_timeout",
+                    fmt::format("running_replan_id={};elapsed_sec={:.3f};timeout_sec={:.3f};action=terminal_emergency_hold",
+                                running_id, now - started_at, timeout),
+                    OPT_FAILED, -1, false, -1, running_id);
+            ros_ptr_->error(
+                    " -- [Fsm] State2state replan {} exceeded {:.3f}s ({:.3f}s); enter terminal emergency hold and wait for the old planner call to return.",
+                    running_id, timeout, now - started_at);
+            ChangeState("State2StateReplanWatchdog", EMER_STOP);
+        }
+        return true;
     }
 
     bool Fsm::closeToGoal(const double &thresh_dis) {
@@ -1495,6 +1610,16 @@ namespace fsm {
                                           mission::NavigationRole role) {
         if (!goal.position.allFinite()) {
             return false;
+        }
+        // HOME disables the normal per-tick breadcrumb sampler. Capture one
+        // last fresh executed pose before flipping the role so a mission
+        // transition cannot leave the return chain one callback behind.
+        if (role == mission::NavigationRole::HOME && planner_ptr_) {
+            planner_ptr_->getRobotState(robot_state_);
+            if (robot_state_.rcv && robot_state_.p.allFinite() &&
+                (ros_ptr_->getSimTime() - robot_state_.rcv_time) <= 0.2) {
+                planner_ptr_->observeState2StateReturnBreadcrumb(robot_state_.p);
+            }
         }
         active_navigation_role_ = role;
         applyInspectionMotionProfile(role);
@@ -2272,6 +2397,16 @@ namespace fsm {
     void Fsm::setGoalPosiAndYaw(const Vec3f &p,
                                 const Quatf &q,
                                 const GoalHeightMode height_mode) {
+        // A watchdog timeout is a safety boundary. While its old planner call
+        // is still draining, accepting another goal would eventually create a
+        // second call against the same GeneralPlanner instance.
+        if (state2state_replan_timeout_terminal_.load(std::memory_order_acquire) &&
+            state2state_replan_in_progress_.load(std::memory_order_acquire)) {
+            recordDiagnosticEvent("WARN", "goal_rejected",
+                                  "reason=state2state_replan_watchdog_draining",
+                                  OPT_FAILED);
+            return;
+        }
         // External RViz clicks during an active inspection mission cancel it
         // and are otherwise rejected so they cannot overwrite mission goals.
         if (!mission_goal_submission_) {
@@ -2405,6 +2540,11 @@ namespace fsm {
 
         started_ = true;
         gi_.new_goal = true;
+        if (state2state_replan_timeout_terminal_.exchange(
+                false, std::memory_order_acq_rel)) {
+            recordDiagnosticEvent("INFO", "state2state_replan_watchdog_reset",
+                                  "accepted_fresh_goal_after_old_replan_returned");
+        }
         resetState2StatePlanFromRestFailure();
         recordDiagnosticEvent("INFO",
                               "goal_accepted",

@@ -400,8 +400,19 @@ namespace state2state_task {
                 }
 
                 vec_Vec3f raw_route;
-                const bool reaches_goal = services.map_manager->findTopologyPath(
+                // The executed-history backbone is a stronger return proof
+                // than the sparse topology skeleton. Query it first so A*
+                // cannot replace the actual flown corridor with long diagonal
+                // skeleton shortcuts and their sparse, folded waypoints.
+                bool reaches_goal = services.map_manager->findExecutedTopologyHistoryPath(
                     snapshot, temp_start_point, goal, raw_route);
+                const GlobalRouteSource route_source = reaches_goal
+                    ? GlobalRouteSource::EXECUTED_HISTORY
+                    : GlobalRouteSource::TOPOLOGY;
+                if (!reaches_goal) {
+                    reaches_goal = services.map_manager->findTopologyPath(
+                        snapshot, temp_start_point, goal, raw_route);
+                }
                 if (!reaches_goal || raw_route.size() < 2) {
                     route.last_result = "TOPO_HOME_NOT_CONNECTED";
                     services.ros_ptr->warn(
@@ -415,7 +426,7 @@ namespace state2state_task {
 
                 route.valid = true;
                 route.reaches_goal = reaches_goal;
-                route.source = GlobalRouteSource::TOPOLOGY;
+                route.source = route_source;
                 ++route.route_id;
                 route.task_epoch = task_epoch;
                 route.world_epoch = world_epoch;
@@ -425,10 +436,13 @@ namespace state2state_task {
                 route.raw_topology_route = std::move(raw_route);
                 buildRouteArcLength(route.raw_topology_route, route.arc_length);
                 route.committed_route_s = 0.0;
-                route.last_result = "TOPO_HOME_ROUTE_READY";
+                route.last_result = route_source == GlobalRouteSource::EXECUTED_HISTORY
+                    ? "EXECUTED_HISTORY_HOME_ROUTE_READY"
+                    : "TOPO_HOME_ROUTE_READY";
                 services.ros_ptr->vizGoalPath(route.raw_topology_route);
                 services.ros_ptr->info(
-                    " -- [GeneralPlanner] Topology/history A* route ready: id={}, points={}, length={:.2f}m, reaches_goal={}, result={}, history_nodes={}.",
+                    " -- [GeneralPlanner] {} return route ready: id={}, points={}, length={:.2f}m, reaches_goal={}, result={}, history_nodes={}.",
+                    toString(route_source),
                     route.route_id,
                     route.raw_topology_route.size(),
                     route.arc_length.empty() ? 0.0 : route.arc_length.back(),
@@ -452,6 +466,8 @@ namespace state2state_task {
                     services.cfg.state2state_topology_breadcrumb_attach_radius,
                     2.0 * services.cfg.resolution);
                 std::size_t attach_index = breadcrumb.path.size();
+                vec_Vec3f local_rejoin_path;
+                bool used_local_rejoin = false;
                 for (std::size_t i = breadcrumb.path.size(); i-- > 0;) {
                     const Vec3f &anchor = breadcrumb.path[i];
                     if ((anchor - temp_start_point).norm() > attach_radius ||
@@ -461,14 +477,93 @@ namespace state2state_task {
                     attach_index = i;
                     break;
                 }
+
+                // A precise executed breadcrumb can still be locally
+                // reconnectable when its latest point is not visible in a
+                // straight line (for example after a turn or a local-map
+                // update).  Use the same bounded, unknown-as-occupied local
+                // A* policy as topology-route repair; never invent a direct
+                // flight through unknown space just to reach Home.
+                if (attach_index == breadcrumb.path.size()) {
+                    struct RejoinCandidate {
+                        std::size_t index{0};
+                        double distance{0.0};
+                    };
+                    std::vector<RejoinCandidate> candidates;
+                    const double rejoin_horizon = std::max(searching_horizon,
+                                                           attach_radius);
+                    for (std::size_t i = breadcrumb.path.size(); i-- > 0;) {
+                        const Vec3f &anchor = breadcrumb.path[i];
+                        const double distance = (anchor - temp_start_point).norm();
+                        if (distance > rejoin_horizon || !pointUsable(anchor)) {
+                            continue;
+                        }
+                        // Reverse iteration deliberately favors the newest
+                        // anchor, minimizing the unverified gap before the
+                        // vehicle resumes retracing the flown corridor.
+                        candidates.push_back({i, distance});
+                    }
+                    const std::size_t attempts = std::min<std::size_t>(
+                        static_cast<std::size_t>(std::max(
+                            1, services.cfg.state2state_topology_route_rejoin_max_candidates)),
+                        candidates.size());
+                    for (std::size_t attempt = 0; attempt < attempts; ++attempt) {
+                        vec_Vec3f repair_path;
+                        const RET_CODE repair_ret = services.astar->pointToPointPathSearch(
+                            temp_start_point,
+                            breadcrumb.path[candidates[attempt].index],
+                            flag, rejoin_horizon, repair_path,
+                            services.cfg.frontend_astar_time_out);
+                        if (repair_ret != REACH_GOAL || repair_path.size() < 2) {
+                            continue;
+                        }
+                        vec_Vec3f verified_rejoin;
+                        appendPathPointUnique(temp_start_point, verified_rejoin);
+                        bool rejoin_safe = true;
+                        for (const Vec3f &point : repair_path) {
+                            if ((point - verified_rejoin.back()).norm() <= 1.0e-6) {
+                                continue;
+                            }
+                            if (!lineUsable(verified_rejoin.back(), point)) {
+                                rejoin_safe = false;
+                                break;
+                            }
+                            appendPathPointUnique(point, verified_rejoin);
+                        }
+                        if (!rejoin_safe || verified_rejoin.size() < 2) {
+                            continue;
+                        }
+                        attach_index = candidates[attempt].index;
+                        local_rejoin_path = std::move(verified_rejoin);
+                        used_local_rejoin = true;
+                        break;
+                    }
+                }
                 if (attach_index == breadcrumb.path.size()) {
                     route.last_result = "BREADCRUMB_NOT_ATTACHABLE";
+                    const Vec3f &tail = breadcrumb.path.back();
+                    if (breadcrumb.last_result != "BREADCRUMB_NOT_ATTACHABLE") {
+                        services.ros_ptr->warn(
+                            " -- [GeneralPlanner] Breadcrumb cannot rejoin: current=[{:.2f},{:.2f},{:.2f}], tail=[{:.2f},{:.2f},{:.2f}], tail_distance={:.2f}m, direct_attach_radius={:.2f}m, local_rejoin_horizon={:.2f}m, record_failure={}.",
+                            temp_start_point.x(), temp_start_point.y(), temp_start_point.z(),
+                            tail.x(), tail.y(), tail.z(),
+                            (tail - temp_start_point).norm(), attach_radius,
+                            std::max(searching_horizon, attach_radius),
+                            breadcrumb.last_record_failure);
+                    }
+                    // Preserve the recorder's root cause independently from
+                    // this route-query result for the next diagnostic sample.
+                    runtime.breadcrumb.last_result = "BREADCRUMB_NOT_ATTACHABLE";
                     return false;
                 }
 
                 vec_Vec3f raw_route;
-                appendPathPointUnique(temp_start_point, raw_route);
-                appendPathPointUnique(breadcrumb.path[attach_index], raw_route);
+                if (used_local_rejoin) {
+                    raw_route = std::move(local_rejoin_path);
+                } else {
+                    appendPathPointUnique(temp_start_point, raw_route);
+                    appendPathPointUnique(breadcrumb.path[attach_index], raw_route);
+                }
                 for (std::size_t i = attach_index; i > 0; --i) {
                     appendPathPointUnique(breadcrumb.path[i - 1], raw_route);
                 }
@@ -489,9 +584,13 @@ namespace state2state_task {
                 buildRouteArcLength(route.raw_topology_route, route.arc_length);
                 route.committed_route_s = 0.0;
                 route.last_result = "BREADCRUMB_ROUTE_READY";
+                if (used_local_rejoin) {
+                    route.last_result = "BREADCRUMB_LOCAL_REJOIN_ROUTE_READY";
+                }
                 services.ros_ptr->vizGoalPath(route.raw_topology_route);
                 services.ros_ptr->warn(
-                    " -- [GeneralPlanner] Topology route unavailable; retrace verified breadcrumb: id={}, points={}, length={:.2f}m.",
+                    " -- [GeneralPlanner] Topology route unavailable; retrace verified breadcrumb{}: id={}, points={}, length={:.2f}m.",
+                    used_local_rejoin ? " after local A* rejoin" : "",
                     route.route_id, route.raw_topology_route.size(),
                     route.arc_length.empty() ? 0.0 : route.arc_length.back());
                 return true;
@@ -570,6 +669,8 @@ namespace state2state_task {
             const double prefix_step = std::max(
                 0.25, std::max(services.cfg.resolution,
                                services.map_manager->getInfResolution()));
+            Vec3f first_boundary_point = Vec3f::Constant(
+                std::numeric_limits<double>::quiet_NaN());
             const auto appendCheckedSegment = [&](const Vec3f &end,
                                                   const bool require_interior,
                                                   vec_Vec3f &out,
@@ -584,6 +685,9 @@ namespace state2state_task {
                         (end - start);
                     if (require_interior && !insideLocalInterior(sample)) {
                         boundary_limited = true;
+                        if (!first_boundary_point.allFinite()) {
+                            first_boundary_point = sample;
+                        }
                         return false;
                     }
                     if (!lineUsable(out.back(), sample)) {
@@ -711,21 +815,47 @@ namespace state2state_task {
             // progress hint. Try the same bounded local rejoin used by real
             // planner before discarding it; boundary-limited prefixes may
             // also need this when the rolling map moved since the last tick.
-            if ((blocked || route.source == GlobalRouteSource::BREADCRUMB) &&
+            if (shouldAttemptTopologyLocalRepair(blocked, boundary_limited,
+                                                  route.source) &&
                 repairToRouteSuffix()) {
                 return true;
             }
             const GlobalRouteSource rejected_source = route.source;
             const std::string rejected_reason = blocked
                 ? "TOPO_PREFIX_BLOCKED" : "TOPO_PREFIX_OUT_OF_LOCAL_WINDOW";
+            double candidate_length = 0.0;
+            for (std::size_t i = 1; i < candidate.size(); ++i) {
+                candidate_length += (candidate[i] - candidate[i - 1]).norm();
+            }
             services.ros_ptr->warn(
-                " -- [GeneralPlanner] Reject local prefix from {}: blocked={} boundary_limited={}; retain return history and wait for a safe rejoin.",
+                " -- [GeneralPlanner] Reject local prefix from {}: blocked={} boundary_limited={}, candidate_points={}, candidate_length={:.2f}m, route_s=[{:.2f},{:.2f}], map_revision={}, local_box=[[{:.2f},{:.2f},{:.2f}],[{:.2f},{:.2f},{:.2f}]], first_boundary=[{:.2f},{:.2f},{:.2f}].",
                 toString(rejected_source), static_cast<int>(blocked),
-                static_cast<int>(boundary_limited));
+                static_cast<int>(boundary_limited), candidate.size(), candidate_length,
+                route_start_s, route_end_s, services.map_manager->mapRevision(),
+                local_min.x(), local_min.y(), local_min.z(),
+                local_max.x(), local_max.y(), local_max.z(),
+                first_boundary_point.x(), first_boundary_point.y(),
+                first_boundary_point.z());
+
+            // A local-window miss does not invalidate a global route that
+            // reaches Home. Keep that route stable and, when possible, use
+            // the independently verified executed breadcrumb on the next
+            // planning tick. Re-querying the same topology snapshot while
+            // the vehicle is stationary only recreates the observed failure.
+            if (boundary_limited && !blocked) {
+                if (rejected_source == GlobalRouteSource::TOPOLOGY &&
+                    buildBreadcrumbRoute()) {
+                    route.last_result = "BREADCRUMB_ROUTE_READY_WAIT_LOCAL_REJOIN";
+                } else {
+                    route.last_result = "TOPO_LOCAL_WINDOW_WAIT";
+                }
+                return false;
+            }
+
             clearRoute(rejected_reason,
                        false);
             if (queryGlobalRoute(true)) {
-                route.last_result = "TOPO_REQUERY_READY_LOCAL_FALLBACK";
+                route.last_result = "TOPO_REQUERY_READY_LOCAL_REJOIN";
             } else if (rejected_source == GlobalRouteSource::BREADCRUMB &&
                        buildBreadcrumbRoute()) {
                 route.last_result = "BREADCRUMB_RETAINED_WAIT_LOCAL_REJOIN";
@@ -741,12 +871,21 @@ namespace state2state_task {
                 (goal - temp_start_point).norm() >= std::max(
                     0.0, services.cfg.state2state_topology_min_query_distance);
         if (!topology_frontend && long_range_home_return) {
-            const std::string reason = services.topology_route_runtime != nullptr
-                ? services.topology_route_runtime->route.last_result
-                : "NO_RETURN_RUNTIME";
-            services.ros_ptr->warn(
-                " -- [GeneralPlanner] Refuse direct/local fallback for RETURN_HOME: no complete topology or verified breadcrumb route ({}).",
-                reason);
+            const auto *runtime = services.topology_route_runtime;
+            const std::string reason = runtime != nullptr
+                ? runtime->route.last_result : "NO_RETURN_RUNTIME";
+            const bool complete_global_route = runtime != nullptr &&
+                runtime->route.valid && runtime->route.reaches_goal &&
+                runtime->route.source != GlobalRouteSource::NONE;
+            if (complete_global_route) {
+                services.ros_ptr->warn(
+                    " -- [GeneralPlanner] RETURN_HOME has a complete {} route but no locally executable/rejoinable prefix yet ({}); keep the vehicle at its last safe state.",
+                    toString(runtime->route.source), reason);
+            } else {
+                services.ros_ptr->warn(
+                    " -- [GeneralPlanner] Refuse direct/local fallback for RETURN_HOME: no complete topology or verified breadcrumb route ({}).",
+                    reason);
+            }
             return false;
         }
         const bool direct_line_frontend = !topology_frontend &&

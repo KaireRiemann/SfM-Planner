@@ -1167,7 +1167,10 @@ namespace fsm {
             viewing_rays.color.b = 0.1;
             viewing_rays.color.a = 0.55;
 
-            for (const auto &viewpoint : coverage.ordered_viewpoints) {
+            for (std::size_t sequence_index = 0;
+                 sequence_index < coverage.ordered_viewpoints.size();
+                 ++sequence_index) {
+                const auto &viewpoint = coverage.ordered_viewpoints[sequence_index];
                 if (!viewpoint.position.allFinite()) {
                     continue;
                 }
@@ -1179,7 +1182,7 @@ namespace fsm {
 
                 visualization_msgs::Marker label;
                 initMarker(label, "inspection_viewpoint_labels",
-                           static_cast<int>(viewpoint.id),
+                           static_cast<int>(sequence_index),
                            visualization_msgs::Marker::TEXT_VIEW_FACING);
                 label.pose.position = p;
                 label.pose.position.z += 0.35;
@@ -1188,7 +1191,8 @@ namespace fsm {
                 label.color.g = 1.0;
                 label.color.b = 1.0;
                 label.color.a = 1.0;
-                label.text = std::to_string(viewpoint.id);
+                label.text = fmt::format("{}/{}", sequence_index + 1,
+                                         coverage.ordered_viewpoints.size());
                 markers.markers.push_back(label);
             }
             markers.markers.push_back(viewpoint_sequence);

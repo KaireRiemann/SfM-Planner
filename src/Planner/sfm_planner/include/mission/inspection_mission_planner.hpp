@@ -50,6 +50,8 @@ public:
                const std::string &mission_id = "",
                const MissionPose *approach_override = nullptr);
     void cancel(const std::string &reason);
+    /** Stop without submitting a new RETURN_HOME navigation leg. */
+    void abort(const std::string &reason);
     /** Enforce external perception/capture response deadlines. */
     void tick();
     void onNavigationSucceeded(NavigationRole role, const MissionPose &robot);

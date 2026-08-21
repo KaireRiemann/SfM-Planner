@@ -49,6 +49,13 @@ public:
         // Upper bound on capture poses selected for a single face.  It must
         // be high enough to satisfy K-coverage for large tunnel faces.
         int max_viewpoints{60};
+        // Soft upper target for the distance between consecutive captures.
+        // When a coverage-optimal ordering contains a long jump, the planner
+        // inserts safe intermediate capture poses where possible.  A failure
+        // to find a bridge never invalidates an otherwise complete coverage
+        // plan; use a non-positive value to disable this refinement.
+        double preferred_capture_transition_distance{0.0};
+        int max_transition_bridge_viewpoints{24};
     };
 
     FaceViewpointPlanner() = default;

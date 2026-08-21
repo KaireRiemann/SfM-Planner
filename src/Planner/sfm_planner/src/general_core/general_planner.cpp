@@ -261,7 +261,17 @@ namespace general_planner {
             distance / max_segment)));
         if (breadcrumb.path.size() + static_cast<std::size_t>(segments) >
             static_cast<std::size_t>(max_points)) {
+            const bool first_failure = breadcrumb.last_record_failure !=
+                "BREADCRUMB_CAPACITY_REACHED";
             breadcrumb.last_result = "BREADCRUMB_CAPACITY_REACHED";
+            breadcrumb.last_record_failure = "BREADCRUMB_CAPACITY_REACHED";
+            if (first_failure) {
+                ros_ptr_->warn(
+                    " -- [GeneralPlanner] Return breadcrumb capacity reached: points={}, limit={}, last=[{:.2f},{:.2f},{:.2f}], current=[{:.2f},{:.2f},{:.2f}].",
+                    breadcrumb.path.size(), max_points,
+                    last.x(), last.y(), last.z(),
+                    position.x(), position.y(), position.z());
+            }
             return;
         }
 
@@ -299,12 +309,28 @@ namespace general_planner {
             const Vec3f next = last +
                 (static_cast<double>(i) / segments) * (position - last);
             if (!verifiedSegment(previous, next)) {
+                const bool first_failure = breadcrumb.last_record_failure !=
+                    "BREADCRUMB_SEGMENT_NOT_KNOWN_FREE";
                 breadcrumb.last_result = "BREADCRUMB_SEGMENT_NOT_KNOWN_FREE";
+                breadcrumb.last_record_failure =
+                    "BREADCRUMB_SEGMENT_NOT_KNOWN_FREE";
+                if (first_failure) {
+                    ros_ptr_->warn(
+                        " -- [GeneralPlanner] Return breadcrumb recording paused: segment [{:.2f},{:.2f},{:.2f}] -> [{:.2f},{:.2f},{:.2f}] is not fully local known-free/inflated-free.",
+                        previous.x(), previous.y(), previous.z(),
+                        next.x(), next.y(), next.z());
+                }
                 return;
             }
             appendVerifiedBreadcrumb(breadcrumb, next);
             verified_path.push_back(next);
             previous = next;
+        }
+        if (breadcrumb.last_record_failure != "NONE") {
+            ros_ptr_->info(
+                " -- [GeneralPlanner] Return breadcrumb recording resumed after {}.",
+                breadcrumb.last_record_failure);
+            breadcrumb.last_record_failure = "NONE";
         }
         // Mirror real planner's historical odometry graph: a segment enters
         // the global return graph only after it was actually flown and passed

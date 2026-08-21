@@ -2,10 +2,10 @@
 pcd_name: "cave1.pcd"
 mesh_resource: "package://perfect_drone_sim/meshes/yunque-M.dae"
 init_position:
-  x: 69.410
-  y: -29.0
+  x: 66.410
+  y: -27.0
   z: 1.5
-init_yaw: 109.082
+init_yaw: 1.396263402
 
 #############|For LiDAR perception simulation |#################################
 is_360lidar: true

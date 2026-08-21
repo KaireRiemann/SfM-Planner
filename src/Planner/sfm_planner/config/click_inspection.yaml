@@ -26,6 +26,9 @@ fsm:
   # leg is different: it is a short, static move on an already built map, so
   # do not spin on the same numerical failure for the full approach budget.
   state2state_plan_from_rest_max_failure_sec: 25.0
+  # A non-returning rolling replan enters safety hold; it never permits a
+  # concurrent second planner call on the same GeneralPlanner instance.
+  state2state_replan_timeout_sec: 1.0
   state2state_inspection_capture_max_failure_sec: 8.0
   state2state_inspection_retry_backoff_initial_sec: 0.20
   state2state_inspection_retry_backoff_max_sec: 1.00
@@ -108,7 +111,9 @@ general_planner:
       breadcrumb_enable: true
       breadcrumb_spacing: 0.5
       breadcrumb_max_segment: 1.0
-      breadcrumb_attach_radius: 1.5
+      # Align direct history attachment with the topology history query. The
+      # line is still checked in the inflated known-free local map.
+      breadcrumb_attach_radius: 4.5
       breadcrumb_max_points: 2000
       # Dirty regions nearest to current odom are consumed asynchronously.
       # Tunnel evidence is cheap (voxel seeds, no empty octree), so a larger
@@ -604,6 +609,12 @@ inspection_mission:
     # cave1's ~12 x 8 m face needs more than the old implicit 24-view cap
     # when every sample must be observed twice.
     max_viewpoints: 60
+    # Keep the executed photo sequence locally continuous.  This is a soft
+    # target, not a strict 70% overlap gate: the planner inserts safe bridge
+    # captures for long jumps but retains a complete coverage plan if a bridge
+    # cannot be found.
+    preferred_capture_transition_distance: 3.0
+    max_transition_bridge_viewpoints: 24
     # Per-photo hover dwell before the camera trigger. Set this to 2.0 for a
     # two-second exposure/settling hold; the next leg starts only after the
     # dwell and the capture acknowledgement.

@@ -343,6 +343,12 @@ struct InspectionMissionConfig {
     // escape hatch for degraded operations, not the normal inspection mode.
     double min_predicted_coverage{1.0};
     int max_viewpoints{60};
+    // This is deliberately a soft sequencing target rather than an image
+    // overlap acceptance gate.  Safe bridge captures are inserted to avoid
+    // large discontinuities in the executed photo sequence; an unavailable
+    // bridge is reported but does not reject a complete coverage plan.
+    double preferred_capture_transition_distance{0.0};
+    int max_transition_bridge_viewpoints{24};
     // Hold at a capture pose before triggering the camera.  This gives the
     // vehicle estimator/camera time to settle and ensures the next leg starts
     // from a genuinely stationary state.

@@ -169,6 +169,21 @@ int main() {
         return 1;
     }
 
+    // A failed HOME leg is terminal. The FSM is responsible for clearing its
+    // queued goal after this callback; the mission itself must neither submit
+    // a duplicate HOME request nor remain active.
+    const std::size_t requests_before_home_failure = navigation_requests.size();
+    planner.onNavigationFailed(mission::NavigationRole::HOME,
+                               "home_planning_failed");
+    if (!require(planner.state() == mission::InspectionState::FAILED,
+                 "failed home leg did not become terminal") ||
+        !require(!planner.active(), "failed home leg left mission active") ||
+        !require(navigation_requests.size() == requests_before_home_failure,
+                 "failed home leg submitted a duplicate navigation request")) {
+        std::remove(target_path.c_str());
+        return 1;
+    }
+
     std::remove(target_path.c_str());
     std::cout << "inspection_face_recenter_self_test: PASS" << std::endl;
     return 0;

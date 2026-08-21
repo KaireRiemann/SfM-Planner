@@ -15,19 +15,34 @@ namespace general_planner::state2state_task {
 enum class GlobalRouteSource : std::uint8_t {
     NONE = 0,
     TOPOLOGY = 1,
-    BREADCRUMB = 2
+    EXECUTED_HISTORY = 2,
+    BREADCRUMB = 3
 };
 
 inline const char *toString(const GlobalRouteSource source) {
     switch (source) {
         case GlobalRouteSource::TOPOLOGY:
             return "TOPOLOGY";
+        case GlobalRouteSource::EXECUTED_HISTORY:
+            return "EXECUTED_HISTORY";
         case GlobalRouteSource::BREADCRUMB:
             return "BREADCRUMB";
         case GlobalRouteSource::NONE:
         default:
             return "NONE";
     }
+}
+
+// A complete return route remains useful even when its next raw segment is
+// outside the rolling-map interior. In that case the only permitted local
+// search is a bounded rejoin to an anchor on this already verified route; it
+// is not a permission to search directly toward Home through unknown space.
+inline bool shouldAttemptTopologyLocalRepair(const bool blocked,
+                                             const bool boundary_limited,
+                                             const GlobalRouteSource source) {
+    return blocked || boundary_limited ||
+           source == GlobalRouteSource::EXECUTED_HISTORY ||
+           source == GlobalRouteSource::BREADCRUMB;
 }
 
 /**
@@ -46,6 +61,9 @@ struct VerifiedBreadcrumbContext {
     general_utils::vec_Vec3f path;
     std::vector<double> arc_length;
     std::string last_result{"BREADCRUMB_IDLE"};
+    // Keep the recorder failure separately: route-query failures must not
+    // overwrite the evidence needed to diagnose a broken return chain.
+    std::string last_record_failure{"NONE"};
 };
 
 /**
@@ -119,6 +137,7 @@ inline void resetVerifiedBreadcrumb(VerifiedBreadcrumbContext &breadcrumb,
     breadcrumb.home = home;
     breadcrumb.path.clear();
     breadcrumb.arc_length.clear();
+    breadcrumb.last_record_failure = "NONE";
     if (breadcrumb.active) {
         breadcrumb.path.push_back(home);
         breadcrumb.arc_length.push_back(0.0);

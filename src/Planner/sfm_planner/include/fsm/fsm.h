@@ -298,6 +298,12 @@ namespace fsm {
         // the FSM lock free while it runs, but do not allow a plan-from-rest
         // request to enter the same planner concurrently.
         std::atomic<bool> state2state_replan_in_progress_{false};
+        std::atomic<double> state2state_replan_started_at_{-1.0};
+        std::atomic<std::uint64_t> state2state_replan_running_id_{0};
+        // The main FSM latches this when a detached rolling replan times out;
+        // an eventual late result must not commit a new trajectory.
+        std::atomic<bool> state2state_replan_timeout_latched_{false};
+        std::atomic<bool> state2state_replan_timeout_terminal_{false};
         mutable std::mutex replan_logs_mutex_;
         mutable std::mutex diagnostic_events_mutex_;
         std::ofstream diagnostic_event_log_;
@@ -383,6 +389,12 @@ namespace fsm {
         void callPerceptionSafetyCheckOnce();
 
         void resetState2StatePlanFromRestFailure();
+
+        /**
+         * Bound a detached state2state rolling replan in every FSM state.
+         * Returns true once terminal safety hold owns this tick.
+         */
+        bool handleState2StateReplanWatchdog();
 
         void callMainFsmOnce();
 

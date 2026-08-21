@@ -200,6 +200,9 @@ namespace fsm {
         double task_timeout{0.6};
         int state2state_plan_from_rest_max_failures{0};
         double state2state_plan_from_rest_max_failure_sec{0.0};
+        // A rolling state2state replan is executed off the FSM mutex. It must
+        // be bounded so a non-returning call cannot strand GENERATE_TRAJ.
+        double state2state_replan_timeout_sec{1.0};
         // Inspection approach/return can legitimately wait for map evidence,
         // while a capture-viewpoint retry must be bounded and rate-limited.
         double state2state_inspection_capture_max_failure_sec{0.0};
@@ -362,6 +365,9 @@ namespace fsm {
             loader.LoadParam("fsm/state2state_plan_from_rest_max_failure_sec",
                              state2state_plan_from_rest_max_failure_sec,
                              0.0);
+            loader.LoadParam("fsm/state2state_replan_timeout_sec",
+                             state2state_replan_timeout_sec,
+                             1.0);
             loader.LoadParam("fsm/state2state_inspection_capture_max_failure_sec",
                              state2state_inspection_capture_max_failure_sec,
                              0.0);
@@ -551,6 +557,10 @@ namespace fsm {
                              inspection_mission.min_predicted_coverage, 1.0);
             loader.LoadParam("inspection_mission/coverage/max_viewpoints",
                              inspection_mission.max_viewpoints, 60);
+            loader.LoadParam("inspection_mission/coverage/preferred_capture_transition_distance",
+                             inspection_mission.preferred_capture_transition_distance, 0.0);
+            loader.LoadParam("inspection_mission/coverage/max_transition_bridge_viewpoints",
+                             inspection_mission.max_transition_bridge_viewpoints, 24);
             loader.LoadParam("inspection_mission/coverage/capture_settle_time_sec",
                              inspection_mission.capture_settle_time_sec, 0.5);
             loader.LoadParam("inspection_mission/change_region_thickness",
